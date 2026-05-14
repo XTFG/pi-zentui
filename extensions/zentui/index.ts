@@ -6,7 +6,6 @@ import type {
 	Theme,
 } from "@mariozechner/pi-coding-agent";
 import { type EditorTheme, type TUI, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { registerCompactTools } from "./compact-tools";
 import { type PolishedTuiConfig, colorize, ensureConfigExists, loadConfig } from "./config";
 import { type GitStatusSummary, emptyGitStatus, readGitStatus } from "./git";
 import { type RuntimeInfo, readRuntimeInfo } from "./runtime";
@@ -127,8 +126,6 @@ function formatCwdLabel(cwd: string, cwdIcon: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
-	registerCompactTools(pi);
-
 	const state: FooterState = {
 		modelLabel: "no-model",
 		providerLabel: "Unknown",

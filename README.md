@@ -109,18 +109,9 @@ On first run, Zentui creates a config file at:
     "tokens": "muted",
     "cost": "success",
     "separator": "borderMuted"
-  },
-  "tools": {
-    "style": "compact"
   }
 }
 ```
-
-`tools.style` controls the initial built-in tool output style:
-
-- `compact` — one-line tool calls by default
-- `truncated` — expanded preview with long output truncated
-- `full` — expanded full output
 
 ### Color values
 
