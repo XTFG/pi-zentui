@@ -7,6 +7,7 @@ import {
 	mergeConfig,
 	saveColorSourcesPatch,
 	saveExtensionStatusPlacement,
+	saveUiFeaturesPatch,
 } from "../extensions/zentui/config";
 import {
 	colorize,
@@ -31,6 +32,10 @@ describe("mergeConfig", () => {
 			starship: "theme",
 			editor: "theme",
 			userMessages: "theme",
+		});
+		expect(config.features).toEqual({
+			editor: true,
+			statusLine: true,
 		});
 		expect(config.extensionStatuses).toEqual({
 			defaultPlacement: "right",
@@ -188,6 +193,17 @@ describe("mergeConfig", () => {
 		).toEqual({ starship: "theme", editor: "theme", userMessages: "terminal" });
 	});
 
+	it("accepts valid UI feature preferences and ignores invalid values", () => {
+		expect(mergeConfig({ features: { editor: false } }).features).toEqual({
+			editor: false,
+			statusLine: true,
+		});
+		expect(mergeConfig({ features: { editor: "off", statusLine: false } }).features).toEqual({
+			editor: true,
+			statusLine: false,
+		});
+	});
+
 	it("saves color source patches without erasing unknown user config", () => {
 		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
 		const path = join(dir, "zentui.json");
@@ -286,6 +302,60 @@ describe("mergeConfig", () => {
 				userMessages: "theme",
 			});
 			expect(raw).toEqual({ colorSources: { starship: "terminal" } });
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("saves UI feature patches without erasing unknown user config", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		try {
+			writeFileSync(
+				path,
+				`${JSON.stringify(
+					{
+						unknown: true,
+						features: {
+							editor: true,
+							futureKey: "future",
+						},
+					},
+					null,
+					2,
+				)}\n`,
+			);
+
+			const config = saveUiFeaturesPatch({ statusLine: false }, path);
+			const raw = JSON.parse(readFileSync(path, "utf8"));
+
+			expect(config.features).toEqual({
+				editor: true,
+				statusLine: false,
+			});
+			expect(raw.unknown).toBe(true);
+			expect(raw.features).toEqual({
+				editor: true,
+				futureKey: "future",
+				statusLine: false,
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("writes only the requested UI feature setting when creating zentui.json", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		try {
+			const config = saveUiFeaturesPatch({ editor: false }, path);
+			const raw = JSON.parse(readFileSync(path, "utf8"));
+
+			expect(config.features).toEqual({
+				editor: false,
+				statusLine: true,
+			});
+			expect(raw).toEqual({ features: { editor: false } });
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

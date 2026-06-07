@@ -7,7 +7,7 @@ import {
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type ExtensionStatusPlacement,
 	type PolishedTuiConfig,
@@ -129,10 +129,16 @@ function makeStrictTheme(): Theme {
 }
 
 function makeUi(prefix = "") {
+	let editorComponent: unknown;
 	return {
 		theme: makeTaggedTheme(prefix),
 		setFooter() {},
-		setEditorComponent() {},
+		setEditorComponent(factory: unknown) {
+			editorComponent = factory;
+		},
+		getEditorComponent() {
+			return editorComponent;
+		},
 	};
 }
 
@@ -213,18 +219,27 @@ async function emit(handlers: Map<string, Handler[]>, eventName: string, ctx: un
 
 function makeContext(overrides: Record<string, unknown> = {}) {
 	const theme = makeTheme();
+	let editorComponent: unknown;
+	const ui = {
+		theme,
+		setFooter() {},
+		setEditorComponent(factory: unknown) {
+			editorComponent = factory;
+		},
+		getEditorComponent() {
+			return editorComponent;
+		},
+	};
+	const overrideUi = overrides.ui && typeof overrides.ui === "object" ? overrides.ui : undefined;
 	return {
 		hasUI: true,
 		cwd: process.cwd(),
 		model: { id: "claude-sonnet", provider: "anthropic", contextWindow: 200_000 },
 		sessionManager: { getBranch: () => [] },
 		getContextUsage: () => ({ tokens: 1000, contextWindow: 200_000, percent: 0.5 }),
-		ui: {
-			theme,
-			setFooter() {},
-			setEditorComponent() {},
-		},
+		ui: overrideUi ? { ...ui, ...overrideUi } : ui,
 		...overrides,
+		...(overrideUi ? { ui: { ...ui, ...overrideUi } } : {}),
 	};
 }
 
@@ -291,6 +306,31 @@ describe("Pi docs compliance", () => {
 		await emit(handlers, "session_start", ctx);
 
 		expect(UserMessageComponent.prototype.render).toBe(originalUserMessageRender);
+	});
+
+	it("does not overwrite an editor component already installed by another extension", async () => {
+		const handlers = loadExtension();
+		const existingEditorFactory = () => ({ render: () => [] });
+		let editorFactory: unknown = existingEditorFactory;
+		let setEditorCalls = 0;
+		const ctx = makeContext({
+			ui: {
+				theme: makeTheme(),
+				setFooter() {},
+				setEditorComponent(factory: unknown) {
+					setEditorCalls += 1;
+					editorFactory = factory;
+				},
+				getEditorComponent() {
+					return editorFactory;
+				},
+			},
+		});
+
+		await emit(handlers, "session_start", ctx);
+
+		expect(setEditorCalls).toBe(0);
+		expect(editorFactory).toBe(existingEditorFactory);
 	});
 
 	it("renders user messages like the ZentUI prompt box", async () => {
@@ -880,6 +920,7 @@ describe("Pi docs compliance", () => {
 			{
 				getConfig: () => defaultConfig,
 				setColorSources() {},
+				setUiFeatures: () => ({ applied: true }),
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				requestRender() {},
@@ -902,6 +943,178 @@ describe("Pi docs compliance", () => {
 		expect(customOpened).toBe(false);
 	});
 
+	it("toggles the editor from direct Zentui slash-command arguments", async () => {
+		let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+		const featureChanges: Partial<PolishedTuiConfig["features"]>[] = [];
+		const notifications: Array<{ message: string; level: string }> = [];
+		let renderRequests = 0;
+
+		registerZentuiSettingsCommand(
+			{
+				registerCommand(_name: string, options: unknown) {
+					command = options as typeof command;
+				},
+			} as never,
+			{
+				getConfig: () => defaultConfig,
+				setColorSources() {},
+				setUiFeatures(patch) {
+					featureChanges.push(patch);
+					return { applied: true };
+				},
+				getActiveExtensionStatuses: () => new Map<string, string>(),
+				setExtensionStatusPlacement() {},
+				requestRender() {
+					renderRequests += 1;
+				},
+			},
+		);
+
+		await command?.handler("editor disable", {
+			hasUI: true,
+			ui: {
+				notify(message: string, level: string) {
+					notifications.push({ message, level });
+				},
+			},
+		});
+
+		expect(featureChanges).toEqual([{ editor: false }]);
+		expect(renderRequests).toBe(1);
+		expect(notifications).toEqual([{ message: "Editor: disabled", level: "info" }]);
+	});
+
+	it("toggles the status line from direct Zentui slash-command arguments", async () => {
+		let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+		const featureChanges: Partial<PolishedTuiConfig["features"]>[] = [];
+
+		registerZentuiSettingsCommand(
+			{
+				registerCommand(_name: string, options: unknown) {
+					command = options as typeof command;
+				},
+			} as never,
+			{
+				getConfig: () => defaultConfig,
+				setColorSources() {},
+				setUiFeatures(patch) {
+					featureChanges.push(patch);
+					return { applied: true };
+				},
+				getActiveExtensionStatuses: () => new Map<string, string>(),
+				setExtensionStatusPlacement() {},
+				requestRender() {},
+			},
+		);
+
+		await command?.handler("status line off", { hasUI: false });
+
+		expect(featureChanges).toEqual([{ statusLine: false }]);
+	});
+
+	it("shows when an editor toggle needs reload because another extension owns the editor", async () => {
+		let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+		const notifications: Array<{ message: string; level: string }> = [];
+
+		registerZentuiSettingsCommand(
+			{
+				registerCommand(_name: string, options: unknown) {
+					command = options as typeof command;
+				},
+			} as never,
+			{
+				getConfig: () => defaultConfig,
+				setColorSources() {},
+				setUiFeatures: () => ({
+					applied: false,
+					reason:
+						"another extension is currently managing the editor; reload Pi to apply this change",
+				}),
+				getActiveExtensionStatuses: () => new Map<string, string>(),
+				setExtensionStatusPlacement() {},
+				requestRender() {},
+			},
+		);
+
+		await command?.handler("editor disable", {
+			hasUI: true,
+			ui: {
+				notify(message: string, level: string) {
+					notifications.push({ message, level });
+				},
+			},
+		});
+
+		expect(notifications).toEqual([
+			{
+				message:
+					"Editor: disabled (another extension is currently managing the editor; reload Pi to apply this change)",
+				level: "info",
+			},
+		]);
+	});
+
+	it("closes the Zentui settings UI before applying an editor feature change", async () => {
+		vi.useFakeTimers();
+		try {
+			let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+			let doneCalls = 0;
+			const doneCallsAtFeatureChange: number[] = [];
+
+			registerZentuiSettingsCommand(
+				{
+					registerCommand(_name: string, options: unknown) {
+						command = options as typeof command;
+					},
+				} as never,
+				{
+					getConfig: () => defaultConfig,
+					setColorSources() {},
+					setUiFeatures() {
+						doneCallsAtFeatureChange.push(doneCalls);
+						return { applied: true };
+					},
+					getActiveExtensionStatuses: () => new Map<string, string>(),
+					setExtensionStatusPlacement() {},
+					requestRender() {},
+					settingsListTheme: {
+						label: (text) => text,
+						value: (text) => text,
+						description: (text) => text,
+						cursor: "> ",
+						hint: (text) => text,
+					},
+				},
+			);
+
+			await command?.handler("", {
+				hasUI: true,
+				ui: {
+					theme: makeTaggedTheme(),
+					notify() {},
+					async custom(factory: (...args: unknown[]) => unknown) {
+						const component = factory({ requestRender() {} }, makeTaggedTheme(), {}, () => {
+							doneCalls += 1;
+						}) as { handleInput?: (data: string) => void };
+						component.handleInput?.("\x1b[B");
+						component.handleInput?.("\x1b[B");
+						component.handleInput?.("\x1b[B");
+						component.handleInput?.(" ");
+					},
+				},
+			});
+
+			expect(doneCalls).toBe(1);
+			expect(doneCallsAtFeatureChange).toEqual([]);
+
+			vi.runAllTimers();
+
+			expect(doneCallsAtFeatureChange).toEqual([1]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("renders Zentui settings with mode-aware top and bottom borders", async () => {
 		async function renderSettings(config: PolishedTuiConfig) {
 			let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
@@ -916,6 +1129,7 @@ describe("Pi docs compliance", () => {
 				{
 					getConfig: () => config,
 					setColorSources() {},
+					setUiFeatures: () => ({ applied: true }),
 					getActiveExtensionStatuses: () => new Map<string, string>(),
 					setExtensionStatusPlacement() {},
 					requestRender() {},
@@ -969,6 +1183,7 @@ describe("Pi docs compliance", () => {
 			{
 				getConfig: () => defaultConfig,
 				setColorSources() {},
+				setUiFeatures: () => ({ applied: true }),
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				requestRender() {},
@@ -1017,6 +1232,7 @@ describe("Pi docs compliance", () => {
 				setColorSources(patch) {
 					changes.push(patch);
 				},
+				setUiFeatures: () => ({ applied: true }),
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				requestRender() {
@@ -1078,6 +1294,7 @@ describe("Pi docs compliance", () => {
 				setColorSources(patch) {
 					changes.push(patch);
 				},
+				setUiFeatures: () => ({ applied: true }),
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				requestRender() {},
@@ -1126,6 +1343,7 @@ describe("Pi docs compliance", () => {
 			{
 				getConfig: () => defaultConfig,
 				setColorSources() {},
+				setUiFeatures: () => ({ applied: true }),
 				getActiveExtensionStatuses: () =>
 					new Map<string, string>([
 						["alpha", "A"],
@@ -1175,6 +1393,7 @@ describe("Pi docs compliance", () => {
 			{
 				getConfig: () => defaultConfig,
 				setColorSources() {},
+				setUiFeatures: () => ({ applied: true }),
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement(key, placement) {
 					placements.push({ key, placement });
@@ -1229,6 +1448,7 @@ describe("Pi docs compliance", () => {
 			{
 				getConfig: () => defaultConfig,
 				setColorSources() {},
+				setUiFeatures: () => ({ applied: true }),
 				getActiveExtensionStatuses: () => new Map<string, string>([["alpha", "ok"]]),
 				setExtensionStatusPlacement(key, placement) {
 					placements.push({ key, placement });
@@ -1291,6 +1511,7 @@ describe("Pi docs compliance", () => {
 						placements: { active: "middle", inactive: "left" },
 					}),
 				setColorSources() {},
+				setUiFeatures: () => ({ applied: true }),
 				getActiveExtensionStatuses: () => new Map<string, string>([["active", "ok"]]),
 				setExtensionStatusPlacement() {},
 				requestRender() {},

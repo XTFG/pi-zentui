@@ -12,6 +12,11 @@ export type ColorSourcesConfig = {
 	userMessages: ColorSource;
 };
 
+export type UiFeaturesConfig = {
+	editor: boolean;
+	statusLine: boolean;
+};
+
 export type ExtensionStatusPlacement = "off" | "left" | "middle" | "right";
 
 export type ExtensionStatusesConfig = {
@@ -64,6 +69,7 @@ export type PolishedTuiConfig = {
 		editorThinkingXhigh?: ColorSpec;
 	};
 	colorSources: ColorSourcesConfig;
+	features: UiFeaturesConfig;
 	extensionStatuses: ExtensionStatusesConfig;
 };
 
@@ -104,6 +110,10 @@ export const defaultConfig: PolishedTuiConfig = {
 		starship: "theme",
 		editor: "theme",
 		userMessages: "theme",
+	},
+	features: {
+		editor: true,
+		statusLine: true,
 	},
 	extensionStatuses: {
 		defaultPlacement: "right",
@@ -164,6 +174,11 @@ function colorSourceValue(
 	return value === "terminal" || value === "theme" ? value : defaultConfig.colorSources[key];
 }
 
+function booleanValue(record: Record<string, unknown>, key: keyof UiFeaturesConfig): boolean {
+	const value = record[key];
+	return typeof value === "boolean" ? value : defaultConfig.features[key];
+}
+
 function definedColors(
 	colors: Partial<Record<keyof PolishedTuiConfig["colors"], string | undefined>>,
 ): Partial<PolishedTuiConfig["colors"]> {
@@ -217,6 +232,13 @@ function normalizeColorSources(record: Record<string, unknown>): ColorSourcesCon
 	};
 }
 
+function normalizeUiFeatures(record: Record<string, unknown>): UiFeaturesConfig {
+	return {
+		editor: booleanValue(record, "editor"),
+		statusLine: booleanValue(record, "statusLine"),
+	};
+}
+
 export function isExtensionStatusPlacement(value: unknown): value is ExtensionStatusPlacement {
 	return value === "off" || value === "left" || value === "middle" || value === "right";
 }
@@ -244,6 +266,10 @@ function isColorSourceKey(value: string): value is keyof ColorSourcesConfig {
 	return value === "starship" || value === "editor" || value === "userMessages";
 }
 
+function isUiFeatureKey(value: string): value is keyof UiFeaturesConfig {
+	return value === "editor" || value === "statusLine";
+}
+
 function validColorSourceEntries(record: Record<string, unknown>): Partial<ColorSourcesConfig> {
 	return Object.fromEntries(
 		Object.entries(record).filter((entry): entry is [keyof ColorSourcesConfig, ColorSource] => {
@@ -251,6 +277,15 @@ function validColorSourceEntries(record: Record<string, unknown>): Partial<Color
 			return isColorSourceKey(key) && (value === "theme" || value === "terminal");
 		}),
 	) as Partial<ColorSourcesConfig>;
+}
+
+function validUiFeatureEntries(record: Record<string, unknown>): Partial<UiFeaturesConfig> {
+	return Object.fromEntries(
+		Object.entries(record).filter((entry): entry is [keyof UiFeaturesConfig, boolean] => {
+			const [key, value] = entry;
+			return isUiFeatureKey(key) && typeof value === "boolean";
+		}),
+	) as Partial<UiFeaturesConfig>;
 }
 
 function readConfigRecord(path = configPath): ConfigRecord {
@@ -281,6 +316,9 @@ export function mergeConfig(parsed: unknown): PolishedTuiConfig {
 	const colorSources = isRecord(config.colorSources)
 		? normalizeColorSources(config.colorSources as Record<string, unknown>)
 		: defaultConfig.colorSources;
+	const features = isRecord(config.features)
+		? normalizeUiFeatures(config.features as Record<string, unknown>)
+		: defaultConfig.features;
 	const extensionStatuses = isRecord(config.extensionStatuses)
 		? normalizeExtensionStatuses(config.extensionStatuses as Record<string, unknown>)
 		: defaultConfig.extensionStatuses;
@@ -295,6 +333,7 @@ export function mergeConfig(parsed: unknown): PolishedTuiConfig {
 			...colors,
 		},
 		colorSources: { ...colorSources },
+		features: { ...features },
 		extensionStatuses: {
 			defaultPlacement: extensionStatuses.defaultPlacement,
 			placements: { ...extensionStatuses.placements },
@@ -329,6 +368,22 @@ export function saveColorSourcesPatch(
 	record.colorSources = {
 		...existing,
 		...validColorSourceEntries(patch),
+	};
+	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+	return mergeConfig(record);
+}
+
+export function saveUiFeaturesPatch(
+	patch: Partial<UiFeaturesConfig>,
+	path = configPath,
+): PolishedTuiConfig {
+	const record = readConfigRecord(path);
+	const existing = isRecord(record.features)
+		? { ...(record.features as Record<string, unknown>) }
+		: {};
+	record.features = {
+		...existing,
+		...validUiFeatureEntries(patch),
 	};
 	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
 	return mergeConfig(record);

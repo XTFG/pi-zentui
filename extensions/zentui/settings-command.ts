@@ -1,6 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import {
+	type AutocompleteItem,
 	type SettingItem,
 	SettingsList,
 	type SettingsListTheme,
@@ -11,6 +12,7 @@ import {
 	type ColorSourcesConfig,
 	type ExtensionStatusPlacement,
 	type PolishedTuiConfig,
+	type UiFeaturesConfig,
 	getExtensionStatusPlacement,
 	isExtensionStatusPlacement,
 } from "./config";
@@ -24,36 +26,72 @@ const extensionStatusPlacementValues: ExtensionStatusPlacement[] = [
 	"middle",
 	"right",
 ];
+type FeatureState = "enabled" | "disabled";
 
-type SettingId = "starship" | "editorMessages";
+const featureStateValues: FeatureState[] = ["enabled", "disabled"];
+
+type ColorSettingId = "starship" | "editorMessages";
+type FeatureSettingId = keyof UiFeaturesConfig;
 
 type SettingsCommandDeps = {
 	getConfig: () => PolishedTuiConfig;
 	setColorSources: (patch: Partial<ColorSourcesConfig>) => void;
+	setUiFeatures: (
+		patch: Partial<UiFeaturesConfig>,
+		ctx: ExtensionContext,
+	) => { applied: boolean; reason?: string };
 	getActiveExtensionStatuses: () => ReadonlyMap<string, string>;
 	setExtensionStatusPlacement: (key: string, placement: ExtensionStatusPlacement) => void;
 	requestRender: () => void;
 	settingsListTheme?: SettingsListTheme;
 };
 
-const settingLabels: Record<SettingId, string> = {
+const colorSettingLabels: Record<ColorSettingId, string> = {
 	starship: "Starship/footer colors",
 	editorMessages: "Editor + previous messages",
 };
 
-const settingDescriptions: Record<SettingId, string> = {
+const colorSettingDescriptions: Record<ColorSettingId, string> = {
 	starship:
 		"Choose whether footer runtime/git/context colors use Pi theme tokens or terminal palette styles.",
 	editorMessages:
 		"Choose whether editor and previous user-message borders/rails use Pi theme colors or terminal palette styles.",
 };
 
+const featureSettingLabels: Record<FeatureSettingId, string> = {
+	editor: "Editor",
+	statusLine: "Status line",
+};
+
+const featureSettingDescriptions: Record<FeatureSettingId, string> = {
+	editor:
+		"Enable or disable Zentui's custom editor, selector borders, and previous-message chrome.",
+	statusLine: "Enable or disable Zentui's custom footer/status line.",
+};
+
+const directCommandSuggestions = [
+	"editor enable",
+	"editor disable",
+	"editor toggle",
+	"statusline enable",
+	"statusline disable",
+	"statusline toggle",
+];
+
 function isColorSource(value: string): value is ColorSource {
 	return value === "theme" || value === "terminal";
 }
 
-function isSettingId(value: string): value is SettingId {
+function isColorSettingId(value: string): value is ColorSettingId {
 	return value === "starship" || value === "editorMessages";
+}
+
+function isFeatureSettingId(value: string): value is FeatureSettingId {
+	return value === "editor" || value === "statusLine";
+}
+
+function isFeatureState(value: string): value is FeatureState {
+	return value === "enabled" || value === "disabled";
 }
 
 function editorMessageValue(config: PolishedTuiConfig): ColorSource | "mixed" {
@@ -62,8 +100,66 @@ function editorMessageValue(config: PolishedTuiConfig): ColorSource | "mixed" {
 		: "mixed";
 }
 
-function patchForSetting(id: SettingId, value: ColorSource): Partial<ColorSourcesConfig> {
+function patchForSetting(id: ColorSettingId, value: ColorSource): Partial<ColorSourcesConfig> {
 	return id === "starship" ? { starship: value } : { editor: value, userMessages: value };
+}
+
+function featureValue(enabled: boolean): FeatureState {
+	return enabled ? "enabled" : "disabled";
+}
+
+function featurePatch(id: FeatureSettingId, value: FeatureState): Partial<UiFeaturesConfig> {
+	return { [id]: value === "enabled" } as Partial<UiFeaturesConfig>;
+}
+
+function usageText(): string {
+	return "Usage: /zentui [editor|statusline] [enable|disable|toggle]";
+}
+
+function featureNotification(
+	feature: FeatureSettingId,
+	value: FeatureState,
+	result: { applied: boolean; reason?: string },
+): string {
+	const base = `${featureSettingLabels[feature]}: ${value}`;
+	return result.applied ? base : `${base} (${result.reason ?? "reload Pi to apply this change"})`;
+}
+
+function parseDirectFeatureCommand(
+	args: string,
+	config: PolishedTuiConfig,
+): { feature: FeatureSettingId; enabled: boolean } | undefined {
+	const normalized = args.trim().toLowerCase().replaceAll(/[_-]+/g, " ");
+	if (!normalized) return undefined;
+
+	const words = normalized.split(/\s+/g).filter(Boolean);
+	const hasWord = (value: string) => words.includes(value);
+	const feature = hasWord("editor")
+		? "editor"
+		: hasWord("footer") || hasWord("statusline") || hasWord("status")
+			? "statusLine"
+			: undefined;
+	const action = hasWord("toggle")
+		? "toggle"
+		: hasWord("enable") || hasWord("enabled") || hasWord("on")
+			? "enable"
+			: hasWord("disable") || hasWord("disabled") || hasWord("off")
+				? "disable"
+				: undefined;
+
+	if (!feature || !action) return undefined;
+
+	return {
+		feature,
+		enabled: action === "toggle" ? !config.features[feature] : action === "enable",
+	};
+}
+
+function argumentCompletions(prefix: string): AutocompleteItem[] | null {
+	const trimmedPrefix = prefix.trimStart().toLowerCase();
+	const items = directCommandSuggestions.map((value) => ({ value, label: value }));
+	const matches = items.filter((item) => item.value.startsWith(trimmedPrefix));
+	return matches.length > 0 ? matches : null;
 }
 
 function buildItems(
@@ -72,10 +168,10 @@ function buildItems(
 	thirdPartyStatusesSubmenu: SettingItem["submenu"],
 ): SettingItem[] {
 	return [
-		...(Object.keys(settingLabels) as SettingId[]).map((key) => ({
+		...(Object.keys(colorSettingLabels) as ColorSettingId[]).map((key) => ({
 			id: key,
-			label: settingLabels[key],
-			description: settingDescriptions[key],
+			label: colorSettingLabels[key],
+			description: colorSettingDescriptions[key],
 			currentValue: key === "starship" ? config.colorSources.starship : editorMessageValue(config),
 			values: colorSourceValues,
 		})),
@@ -87,17 +183,62 @@ function buildItems(
 			currentValue: `${activeStatusCount} active`,
 			submenu: thirdPartyStatusesSubmenu,
 		},
+		...(Object.keys(featureSettingLabels) as FeatureSettingId[]).map((key) => ({
+			id: key,
+			label: featureSettingLabels[key],
+			description: featureSettingDescriptions[key],
+			currentValue: featureValue(config.features[key]),
+			values: featureStateValues,
+		})),
 	];
 }
 
 export function registerZentuiSettingsCommand(pi: ExtensionAPI, deps: SettingsCommandDeps): void {
 	pi.registerCommand("zentui", {
 		description: "Configure Zentui",
+		getArgumentCompletions: argumentCompletions,
 		handler: async (_args, ctx) => {
+			const args = typeof _args === "string" ? _args : "";
+			const directCommand = parseDirectFeatureCommand(args, deps.getConfig());
+			if (directCommand) {
+				try {
+					const result = deps.setUiFeatures(
+						{ [directCommand.feature]: directCommand.enabled },
+						ctx,
+					);
+					deps.requestRender();
+					if (ctx.hasUI) {
+						ctx.ui.notify(
+							featureNotification(
+								directCommand.feature,
+								featureValue(directCommand.enabled),
+								result,
+							),
+							"info",
+						);
+					}
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					if (ctx.hasUI) ctx.ui.notify(`Could not update Zentui settings: ${message}`, "error");
+				}
+				return;
+			}
+
+			if (args.trim()) {
+				if (ctx.hasUI) ctx.ui.notify(usageText(), "warning");
+				return;
+			}
+
 			if (!ctx.hasUI) return;
 
 			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
 				const settingsListTheme = deps.settingsListTheme ?? getSettingsListTheme();
+				const applyFeatureChange = (id: FeatureSettingId, newValue: FeatureState) => {
+					const result = deps.setUiFeatures(featurePatch(id, newValue), ctx);
+					deps.requestRender();
+					ctx.ui.notify(featureNotification(id, newValue, result), "info");
+					tui.requestRender();
+				};
 				const makeThirdPartyStatusesSubmenu: SettingItem["submenu"] = (_currentValue, close) => {
 					const activeStatuses = Array.from(deps.getActiveExtensionStatuses().entries()).sort(
 						([a], [b]) => (a < b ? -1 : a > b ? 1 : 0),
@@ -175,14 +316,36 @@ export function registerZentuiSettingsCommand(pi: ExtensionAPI, deps: SettingsCo
 					5,
 					settingsListTheme,
 					(id, newValue) => {
-						if (!isSettingId(id) || !isColorSource(newValue)) return;
-
 						try {
-							deps.setColorSources(patchForSetting(id, newValue));
-							settingsList.updateValue(id, newValue);
-							deps.requestRender();
-							ctx.ui.notify(`${settingLabels[id]}: ${newValue}`, "info");
-							tui.requestRender();
+							if (isColorSettingId(id) && isColorSource(newValue)) {
+								deps.setColorSources(patchForSetting(id, newValue));
+								settingsList.updateValue(id, newValue);
+								deps.requestRender();
+								ctx.ui.notify(`${colorSettingLabels[id]}: ${newValue}`, "info");
+								tui.requestRender();
+								return;
+							}
+
+							if (isFeatureSettingId(id) && isFeatureState(newValue)) {
+								settingsList.updateValue(id, newValue);
+								if (id === "editor") {
+									done(undefined);
+									// Changing the editor component while ctx.ui.custom() is active clears the
+									// custom component without resolving it, leaving Pi's input loop stuck.
+									// Close the settings UI first, then apply the editor swap on the next tick.
+									setTimeout(() => {
+										try {
+											applyFeatureChange(id, newValue);
+										} catch (error) {
+											const message = error instanceof Error ? error.message : String(error);
+											ctx.ui.notify(`Could not update Zentui settings: ${message}`, "error");
+										}
+									}, 0);
+									return;
+								}
+
+								applyFeatureChange(id, newValue);
+							}
 						} catch (error) {
 							const message = error instanceof Error ? error.message : String(error);
 							ctx.ui.notify(`Could not update Zentui settings: ${message}`, "error");

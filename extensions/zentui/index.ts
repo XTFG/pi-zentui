@@ -9,10 +9,12 @@ import {
 	type ColorSourcesConfig,
 	type ExtensionStatusPlacement,
 	type PolishedTuiConfig,
+	type UiFeaturesConfig,
 	ensureConfigExists,
 	loadConfig,
 	saveColorSourcesPatch,
 	saveExtensionStatusPlacement,
+	saveUiFeaturesPatch,
 } from "./config";
 import { installFooter } from "./footer";
 import { emptyGitStatus, readGitStatus } from "./git";
@@ -24,6 +26,22 @@ import { type FooterState, createInitialState, syncState } from "./state";
 import { PolishedEditor } from "./ui";
 import { installUserMessageStyle } from "./user-message";
 
+const ZENTUI_EDITOR_FACTORY = Symbol.for("pi-zentui.editor-factory");
+
+type EditorFactory = NonNullable<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0]>;
+
+type ZentuiEditorFactory = EditorFactory & {
+	[ZENTUI_EDITOR_FACTORY]?: true;
+};
+
+type ApplyUiResult = {
+	editorBlocked: boolean;
+};
+
+function isZentuiEditorFactory(factory: EditorFactory | undefined): boolean {
+	return Boolean((factory as ZentuiEditorFactory | undefined)?.[ZENTUI_EDITOR_FACTORY]);
+}
+
 export default function (pi: ExtensionAPI) {
 	const state: FooterState = createInitialState(emptyGitStatus());
 
@@ -33,6 +51,9 @@ export default function (pi: ExtensionAPI) {
 	let getActiveExtensionStatuses: () => ReadonlyMap<string, string> = () => new Map();
 	let stopRefreshInterval: StopProjectRefreshInterval = () => {};
 	let cleanupPrototypePatches: () => void = () => {};
+	let footerInstalled = false;
+	let editorInstalled = false;
+	let prototypePatchesInstalled = false;
 	let projectRefreshInFlight = false;
 	let projectRefreshPending = false;
 
@@ -72,43 +93,74 @@ export default function (pi: ExtensionAPI) {
 	const refreshInteractiveState = (ctx: ExtensionContext, project = false) => {
 		if (!ctx.hasUI) return;
 		syncFooterState(ctx);
-		if (project) scheduleProjectRefresh(ctx);
+		if (project && currentConfig.features.statusLine) scheduleProjectRefresh(ctx);
 		refresh();
 	};
 
-	const installEditor = (ctx: ExtensionContext) => {
-		ctx.ui.setEditorComponent(
-			(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) =>
-				new PolishedEditor(
-					tui,
-					theme,
-					keybindings,
-					ctx.ui.theme,
-					getCurrentConfig,
-					() => ({
-						modelLabel: state.modelLabel,
-						providerLabel: state.providerLabel,
-					}),
-					getThinkingLevel,
-				),
-		);
+	const stopProjectRefresh = () => {
+		stopRefreshInterval();
+		stopRefreshInterval = () => {};
+		projectRefreshInFlight = false;
+		projectRefreshPending = false;
 	};
 
-	const installUi = (ctx: ExtensionContext) => {
-		if (!ctx.hasUI) return;
-		activeTheme = ctx.ui.theme;
-		cleanupPrototypePatches();
+	const installPrototypePatches = () => {
+		if (prototypePatchesInstalled) return;
 		const cleanupSelectorBorderStyle = installSelectorBorderStyle(getActiveTheme, getCurrentConfig);
 		const cleanupUserMessageStyle = installUserMessageStyle(getActiveTheme, getCurrentConfig);
 		cleanupPrototypePatches = () => {
 			cleanupSelectorBorderStyle();
 			cleanupUserMessageStyle();
 		};
-		ensureConfigExists();
-		currentConfig = loadConfig();
-		syncFooterState(ctx);
-		stopRefreshInterval();
-		stopRefreshInterval = () => {};
+		prototypePatchesInstalled = true;
+	};
+
+	const uninstallPrototypePatches = () => {
+		cleanupPrototypePatches();
+		cleanupPrototypePatches = () => {};
+		prototypePatchesInstalled = false;
+	};
+
+	const makeEditorFactory = (ctx: ExtensionContext): ZentuiEditorFactory => {
+		const factory = ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) =>
+			new PolishedEditor(
+				tui,
+				theme,
+				keybindings,
+				ctx.ui.theme,
+				getCurrentConfig,
+				() => ({
+					modelLabel: state.modelLabel,
+					providerLabel: state.providerLabel,
+				}),
+				getThinkingLevel,
+			)) as ZentuiEditorFactory;
+		factory[ZENTUI_EDITOR_FACTORY] = true;
+		return factory;
+	};
+
+	const installEditor = (ctx: ExtensionContext): boolean => {
+		const currentFactory = ctx.ui.getEditorComponent();
+		if (currentFactory && !isZentuiEditorFactory(currentFactory)) return false;
+
+		installPrototypePatches();
+		ctx.ui.setEditorComponent(makeEditorFactory(ctx));
+		editorInstalled = true;
+		return true;
+	};
+
+	const uninstallEditor = (ctx: ExtensionContext): boolean => {
+		const currentFactory = ctx.ui.getEditorComponent();
+		if (currentFactory && !isZentuiEditorFactory(currentFactory)) return false;
+
+		uninstallPrototypePatches();
+		ctx.ui.setEditorComponent(undefined);
+		editorInstalled = false;
+		return true;
+	};
+
+	const installStatusLine = (ctx: ExtensionContext) => {
+		if (footerInstalled) return;
 		installFooter(ctx, state, getCurrentConfig, {
 			setRequestRender: (fn) => {
 				requestFooterRender = fn;
@@ -118,7 +170,8 @@ export default function (pi: ExtensionAPI) {
 				getActiveExtensionStatuses = fn ?? (() => new Map());
 			},
 		});
-		installEditor(ctx);
+		footerInstalled = true;
+		stopProjectRefresh();
 		stopRefreshInterval = startProjectRefreshInterval(currentConfig.projectRefreshIntervalMs, () =>
 			scheduleProjectRefresh(ctx),
 		);
@@ -126,19 +179,57 @@ export default function (pi: ExtensionAPI) {
 		refresh();
 	};
 
+	const uninstallStatusLine = (ctx: ExtensionContext) => {
+		stopProjectRefresh();
+		ctx.ui.setFooter(undefined);
+		footerInstalled = false;
+		requestFooterRender = undefined;
+		getActiveExtensionStatuses = () => new Map();
+	};
+
+	const applyConfiguredUi = (ctx: ExtensionContext): ApplyUiResult => {
+		const result: ApplyUiResult = { editorBlocked: false };
+		if (!ctx.hasUI) return result;
+		activeTheme = ctx.ui.theme;
+		if (currentConfig.features.editor) {
+			if (!editorInstalled) result.editorBlocked = !installEditor(ctx);
+		} else if (editorInstalled || prototypePatchesInstalled) {
+			result.editorBlocked = !uninstallEditor(ctx);
+		}
+
+		if (currentConfig.features.statusLine) {
+			installStatusLine(ctx);
+		} else if (footerInstalled) {
+			uninstallStatusLine(ctx);
+		}
+		return result;
+	};
+
+	const installUi = (ctx: ExtensionContext) => {
+		if (!ctx.hasUI) return;
+		activeTheme = ctx.ui.theme;
+		uninstallPrototypePatches();
+		footerInstalled = false;
+		editorInstalled = false;
+		ensureConfigExists();
+		currentConfig = loadConfig();
+		syncFooterState(ctx);
+		stopProjectRefresh();
+		applyConfiguredUi(ctx);
+		refresh();
+	};
+
 	const cleanupUi = (ctx?: ExtensionContext) => {
-		cleanupPrototypePatches();
-		cleanupPrototypePatches = () => {};
-		stopRefreshInterval();
-		stopRefreshInterval = () => {};
-		projectRefreshInFlight = false;
-		projectRefreshPending = false;
+		uninstallPrototypePatches();
+		stopProjectRefresh();
 		requestFooterRender = undefined;
 		getActiveExtensionStatuses = () => new Map();
 		if (ctx?.hasUI) {
 			ctx.ui.setFooter(undefined);
 			ctx.ui.setEditorComponent(undefined);
 		}
+		footerInstalled = false;
+		editorInstalled = false;
 		activeTheme = undefined;
 	};
 
@@ -157,6 +248,16 @@ export default function (pi: ExtensionAPI) {
 		getConfig: getCurrentConfig,
 		setColorSources(patch: Partial<ColorSourcesConfig>) {
 			currentConfig = saveColorSourcesPatch(patch);
+		},
+		setUiFeatures(patch: Partial<UiFeaturesConfig>, ctx: ExtensionContext) {
+			currentConfig = saveUiFeaturesPatch(patch);
+			const result = applyConfiguredUi(ctx);
+			return {
+				applied: !(patch.editor !== undefined && result.editorBlocked),
+				reason: result.editorBlocked
+					? "another extension is currently managing the editor; reload Pi to apply this change"
+					: undefined,
+			};
 		},
 		getActiveExtensionStatuses() {
 			return getActiveExtensionStatuses();

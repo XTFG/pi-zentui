@@ -123,7 +123,18 @@ pi install git:github.com/lmilojevicc/pi-zentui
 
 ## Config
 
-User config lives at `~/.pi/agent/zentui.json`. The file is optional: missing or invalid known values fall back to Zentui defaults, unknown keys are ignored at runtime, and `/zentui` can patch color-source settings plus active third-party status placements.
+User config lives at `~/.pi/agent/zentui.json`. The file is optional: missing or invalid known values fall back to Zentui defaults, unknown keys are ignored at runtime, and `/zentui` can patch color-source settings, UI feature toggles, and active third-party status placements.
+
+Useful slash-command shortcuts:
+
+```text
+/zentui editor enable
+/zentui editor disable
+/zentui statusline enable
+/zentui statusline disable
+/zentui editor toggle
+/zentui statusline toggle
+```
 
 Default config values — copy this and change any value you want:
 
@@ -174,6 +185,10 @@ Default config values — copy this and change any value you want:
 		"editor": "theme",
 		"userMessages": "theme"
 	},
+	"features": {
+		"editor": true,
+		"statusLine": true
+	},
 	"extensionStatuses": {
 		"defaultPlacement": "right",
 		"placements": {}
@@ -185,6 +200,7 @@ Default config values — copy this and change any value you want:
 - `projectRefreshIntervalMs`: project status polling interval; `0` disables polling.
 - `icons`: every shown icon key is configurable; omit any key to use the Zentui default.
 - `colorSources`: `theme` maps styles through Pi theme tokens; `terminal` emits terminal colors. `/zentui` switches these sources; manual JSON controls specific style values.
+- `features`: `editor` enables Zentui's custom editor, selector borders, and previous-message chrome. `statusLine` enables Zentui's custom footer/status line. Both can be changed from `/zentui` or direct slash-command arguments.
 - `extensionStatuses`: controls third-party statuses published by other Pi extensions through `ctx.ui.setStatus()`. `defaultPlacement` and each `placements` value can be `off`, `left`, `middle`, or `right`. `/zentui` lists only statuses that are currently active.
 - The shown `editor*` values match the default `theme` source. Omit those keys to keep Zentui's source-aware defaults when switching between `theme` and `terminal`.
 - `editorAccent` styles the active editor rail and previous user-message rail.
