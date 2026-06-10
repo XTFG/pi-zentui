@@ -126,6 +126,8 @@ pi install git:github.com/lmilojevicc/pi-zentui
 
 User config lives at `~/.pi/agent/zentui.json`. The file is optional: missing or invalid known values fall back to Zentui defaults, unknown keys are ignored at runtime, and `/zentui` can patch color-source settings, UI feature toggles, and active third-party status placements.
 
+The interactive `/zentui` menu is split into three sections. Use `Tab` to switch between `Coloring`, `Features`, and `Status line`.
+
 Useful slash-command shortcuts:
 
 ```text
