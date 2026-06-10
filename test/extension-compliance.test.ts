@@ -1077,10 +1077,12 @@ describe("Pi docs compliance", () => {
 		);
 
 		editor.handleInput("i");
+		editor.handleInput("j");
+		editor.handleInput("k");
 		editor.setText("changed");
 		const rendered = editor.render(120).join("\n");
 
-		expect(inputs).toEqual(["i"]);
+		expect(inputs).toEqual(["i", "j", "k"]);
 		expect(editor.getText()).toBe("changed");
 		expect(rendered).toContain("changed");
 		expect(rendered).toContain("[success]INSERT");
