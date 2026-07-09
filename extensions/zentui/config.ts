@@ -142,9 +142,9 @@ export const defaultConfig: PolishedTuiConfig = {
 		runtimePrefix: "",
 		extensionStatus: "bright-black",
 		sessionDuration: "yellow",
-		username: "bright-black",
-		time: "bright-black",
-		os: "bright-black",
+		username: "bold yellow",
+		time: "bold yellow",
+		os: "bold white",
 	},
 	colorSources: {
 		starship: "theme",
