@@ -40,6 +40,7 @@ describe("mergeConfig", () => {
 		});
 		expect(config.features).toEqual({
 			editor: true,
+			userMessages: true,
 			statusLine: true,
 			copyFriendly: false,
 		});
@@ -281,13 +282,17 @@ describe("mergeConfig", () => {
 	it("accepts valid UI feature preferences and ignores invalid values", () => {
 		expect(mergeConfig({ features: { editor: false } }).features).toEqual({
 			editor: false,
+			userMessages: true,
 			statusLine: true,
 			copyFriendly: false,
 		});
 		expect(
-			mergeConfig({ features: { editor: "off", statusLine: false, copyFriendly: true } }).features,
+			mergeConfig({
+				features: { editor: "off", userMessages: false, statusLine: false, copyFriendly: true },
+			}).features,
 		).toEqual({
 			editor: true,
+			userMessages: false,
 			statusLine: false,
 			copyFriendly: true,
 		});
@@ -455,6 +460,7 @@ describe("mergeConfig", () => {
 
 			expect(config.features).toEqual({
 				editor: true,
+				userMessages: true,
 				statusLine: false,
 				copyFriendly: false,
 			});
@@ -478,6 +484,7 @@ describe("mergeConfig", () => {
 
 			expect(config.features).toEqual({
 				editor: false,
+				userMessages: true,
 				statusLine: true,
 				copyFriendly: false,
 			});

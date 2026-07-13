@@ -265,7 +265,7 @@ export function installUserMessageStyle(
 		if (!prototype.__zentuiUserMessageActive) return original.call(this, width);
 
 		const config = prototype.__zentuiUserMessageGetConfig?.();
-		if (!config) return original.call(this, width);
+		if (!config?.features.userMessages) return original.call(this, width);
 
 		const lines = renderZentuiUserMessage(
 			this as PatchableUserMessagePrototype,

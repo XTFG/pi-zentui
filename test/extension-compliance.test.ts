@@ -206,6 +206,11 @@ function stripTestTags(line: string): string {
 	return stripPromptMarks(line).replaceAll(/\[[^\]]+\]/g, "");
 }
 
+function setOriginalUserMessageRenderStub(prefix = "original") {
+	const prototype = UserMessageComponent.prototype as unknown as Record<string, unknown>;
+	prototype.__zentuiUserMessageOriginalRender = (width: number) => [`${prefix}:${width}`];
+}
+
 function loadExtension(options: { thinkingLevel?: string; commands?: Map<string, unknown> } = {}) {
 	const handlers = new Map<string, Handler[]>();
 	zentui({
@@ -525,6 +530,33 @@ describe("Pi docs compliance", () => {
 		expect(rendered.match(/Anthropic/g)).toHaveLength(1);
 	});
 
+	it("keeps the Zentui editor when previous user-message chrome is disabled", async () => {
+		const handlers = loadExtension();
+		let editorFactory: unknown;
+		const ctx = makeContext({
+			ui: {
+				theme: makeTheme(),
+				setFooter() {},
+				setEditorComponent(factory: unknown) {
+					editorFactory = factory;
+				},
+				getEditorComponent() {
+					return editorFactory;
+				},
+			},
+		});
+
+		await emit(handlers, "session_start", ctx);
+		installUserMessageStyle(
+			() => makeTaggedTheme(),
+			() => configWithFeatures({ userMessages: false }),
+		);
+		setOriginalUserMessageRenderStub();
+
+		expect(editorFactory).toBeTypeOf("function");
+		expect(new UserMessageComponent("hello").render(80)).toEqual(["original:80"]);
+	});
+
 	it("re-wraps an editor component that loads after Zentui", async () => {
 		const handlers = loadExtension();
 		const laterEditorFactory = () => ({
@@ -776,9 +808,18 @@ describe("Pi docs compliance", () => {
 		);
 
 		expect(new UserMessageComponent("hello").render(80).join("\n")).toContain("[borderMuted]────");
-		const prototype = UserMessageComponent.prototype as unknown as Record<string, unknown>;
-		prototype.__zentuiUserMessageOriginalRender = (width: number) => [`original:${width}`];
+		setOriginalUserMessageRenderStub();
 		cleanup();
+		expect(new UserMessageComponent("hello").render(80)).toEqual(["original:80"]);
+	});
+
+	it("can disable previous user-message chrome while keeping the patch installed", () => {
+		installUserMessageStyle(
+			() => makeTaggedTheme(),
+			() => configWithFeatures({ userMessages: false }),
+		);
+		setOriginalUserMessageRenderStub();
+
 		expect(new UserMessageComponent("hello").render(80)).toEqual(["original:80"]);
 	});
 
@@ -787,8 +828,7 @@ describe("Pi docs compliance", () => {
 			() => makeTaggedTheme(),
 			() => defaultConfig,
 		);
-		const prototype = UserMessageComponent.prototype as unknown as Record<string, unknown>;
-		prototype.__zentuiUserMessageOriginalRender = (width: number) => [`fallback:${width}`];
+		setOriginalUserMessageRenderStub("fallback");
 
 		const lines = UserMessageComponent.prototype.render.call({ children: [] }, 42);
 
@@ -1644,6 +1684,48 @@ describe("Pi docs compliance", () => {
 		expect(featureChanges).toEqual([{ editor: false }]);
 		expect(renderRequests).toBe(1);
 		expect(notifications).toEqual([{ message: "Editor: disabled", level: "info" }]);
+	});
+
+	it("toggles previous user-message chrome from direct Zentui slash-command arguments", async () => {
+		let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+		const featureChanges: Partial<PolishedTuiConfig["features"]>[] = [];
+		const notifications: Array<{ message: string; level: string }> = [];
+
+		registerZentuiSettingsCommand(
+			{
+				registerCommand(_name: string, options: unknown) {
+					command = options as typeof command;
+				},
+			} as never,
+			{
+				getConfig: () => defaultConfig,
+				setColorSources() {},
+				setUiFeatures(patch) {
+					featureChanges.push(patch);
+					return { applied: true };
+				},
+				setFooterSegments() {},
+				setFooterFormat() {},
+				setIconMode() {},
+				setContextStyle() {},
+				getActiveExtensionStatuses: () => new Map<string, string>(),
+				setExtensionStatusPlacement() {},
+				setExtensionStatusColorMode() {},
+				requestRender() {},
+			},
+		);
+
+		await command?.handler("user-messages disable", {
+			hasUI: true,
+			ui: {
+				notify(message: string, level: string) {
+					notifications.push({ message, level });
+				},
+			},
+		});
+
+		expect(featureChanges).toEqual([{ userMessages: false }]);
+		expect(notifications).toEqual([{ message: "User messages: disabled", level: "info" }]);
 	});
 
 	it("toggles the status line from direct Zentui slash-command arguments", async () => {

@@ -40,7 +40,6 @@ const contextStyleValues: ContextStyle[] = ["text", "gauge", "text+gauge"];
 const iconModeValues: IconMode[] = ["auto", "nerd", "ascii"];
 type FeatureState = "enabled" | "disabled";
 
-const featureStateValues: FeatureState[] = ["enabled", "disabled"];
 const settingsSections = [
 	"coloring",
 	"features",
@@ -54,6 +53,24 @@ type FeatureSettingId = keyof UiFeaturesConfig;
 type FooterSegmentSettingId = keyof FooterSegmentsConfig;
 type SettingsSection = (typeof settingsSections)[number];
 type LayoutSettingId = "contextStyle" | "iconMode";
+type FeatureCommandAction = "enable" | "disable" | "toggle";
+
+const featureStateValues: FeatureState[] = ["enabled", "disabled"];
+const featureCommandNames = new Map<string, FeatureSettingId>([
+	["editor", "editor"],
+	["user messages", "userMessages"],
+	["footer", "statusLine"],
+	["statusline", "statusLine"],
+	["status line", "statusLine"],
+	["copyfriendly", "copyFriendly"],
+	["copy friendly", "copyFriendly"],
+]);
+const featureCommandActions: Array<[FeatureCommandAction, string[]]> = [
+	["toggle", ["toggle"]],
+	["enable", ["enable", "enabled", "on"]],
+	["disable", ["disable", "disabled", "off"]],
+];
+const featureCommandActionWords = new Set(featureCommandActions.flatMap(([, words]) => words));
 
 type SettingsCommandDeps = {
 	getConfig: () => PolishedTuiConfig;
@@ -87,13 +104,14 @@ const colorSettingDescriptions: Record<ColorSettingId, string> = {
 
 const featureSettingLabels: Record<FeatureSettingId, string> = {
 	editor: "Editor",
+	userMessages: "User messages",
 	statusLine: "Status line",
 	copyFriendly: "Copy-friendly mode",
 };
 
 const featureSettingDescriptions: Record<FeatureSettingId, string> = {
-	editor:
-		"Enable or disable Zentui's custom editor, selector borders, and previous-message chrome.",
+	editor: "Enable or disable Zentui's custom editor and selector borders.",
+	userMessages: "Enable or disable Zentui chrome around previous user messages.",
 	statusLine: "Enable or disable Zentui's custom footer/status line.",
 	copyFriendly:
 		"Hide editor and previous-message rail glyphs for cleaner native terminal selection.",
@@ -134,6 +152,9 @@ const directCommandSuggestions = [
 	"editor enable",
 	"editor disable",
 	"editor toggle",
+	"user-messages enable",
+	"user-messages disable",
+	"user-messages toggle",
 	"statusline enable",
 	"statusline disable",
 	"statusline toggle",
@@ -166,7 +187,12 @@ function isColorSettingId(value: string): value is ColorSettingId {
 }
 
 function isFeatureSettingId(value: string): value is FeatureSettingId {
-	return value === "editor" || value === "statusLine" || value === "copyFriendly";
+	return (
+		value === "editor" ||
+		value === "userMessages" ||
+		value === "statusLine" ||
+		value === "copyFriendly"
+	);
 }
 
 function isFooterSegmentSettingId(value: string): value is FooterSegmentSettingId {
@@ -234,7 +260,7 @@ function footerSegmentPatch(
 }
 
 function usageText(): string {
-	return 'Usage: /zentui [editor|statusline|copy-friendly] [enable|disable|toggle] or /zentui format "<template>"';
+	return 'Usage: /zentui [editor|user-messages|statusline|copy-friendly] [enable|disable|toggle] or /zentui format "<template>"';
 }
 
 function featureNotification(
@@ -246,6 +272,18 @@ function featureNotification(
 	return result.applied ? base : `${base} (${result.reason ?? "reload Pi to apply this change"})`;
 }
 
+function findDirectFeature(words: string[]): FeatureSettingId | undefined {
+	const featureName = words.filter((word) => !featureCommandActionWords.has(word)).join(" ");
+	return featureCommandNames.get(featureName);
+}
+
+function parseFeatureCommandAction(words: string[]): FeatureCommandAction | undefined {
+	for (const [action, aliases] of featureCommandActions) {
+		if (aliases.some((alias) => words.includes(alias))) return action;
+	}
+	return undefined;
+}
+
 function parseDirectFeatureCommand(
 	args: string,
 	config: PolishedTuiConfig,
@@ -254,21 +292,8 @@ function parseDirectFeatureCommand(
 	if (!normalized) return undefined;
 
 	const words = normalized.split(/\s+/g).filter(Boolean);
-	const hasWord = (value: string) => words.includes(value);
-	const feature = hasWord("editor")
-		? "editor"
-		: hasWord("footer") || hasWord("statusline") || hasWord("status")
-			? "statusLine"
-			: hasWord("copyfriendly") || hasWord("copy")
-				? "copyFriendly"
-				: undefined;
-	const action = hasWord("toggle")
-		? "toggle"
-		: hasWord("enable") || hasWord("enabled") || hasWord("on")
-			? "enable"
-			: hasWord("disable") || hasWord("disabled") || hasWord("off")
-				? "disable"
-				: undefined;
+	const feature = findDirectFeature(words);
+	const action = parseFeatureCommandAction(words);
 
 	if (!feature || !action) return undefined;
 
@@ -369,9 +394,11 @@ function buildItems(
 		}));
 	}
 
-	const statuses = Array.from(activeStatuses.entries()).sort(([a], [b]) =>
-		a < b ? -1 : a > b ? 1 : 0,
-	);
+	const statuses = Array.from(activeStatuses.entries()).sort(([a], [b]) => {
+		if (a < b) return -1;
+		if (a > b) return 1;
+		return 0;
+	});
 	if (statuses.length === 0) {
 		return [
 			{
