@@ -1,11 +1,72 @@
-import { hostname, userInfo } from "node:os";
+import { homedir, hostname, userInfo } from "node:os";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { ColorSource, ColorSpec, ContextStyle, ContextThresholds } from "./config";
+import type {
+	ColorSource,
+	ColorSpec,
+	ContextStyle,
+	ContextThresholds,
+	PathDisplayMode,
+} from "./config";
+import type { GitCommitInfo, GitMetricsInfo } from "./git";
 import type { IconMode } from "./icons";
-import { resolveOsIcon, resolveRuntimeSymbol } from "./icons";
+import { resolveOsIcon, resolvePackageIcon, resolveRuntimeSymbol } from "./icons";
+import type { PackageVersionResult } from "./package-version";
 import type { RuntimeInfo } from "./runtime";
 import { renderStyleForSource } from "./style";
+
+/**
+ * Starship `git_commit` style — render a short hash, optionally with an
+ * exact-match tag. See https://starship.rs/config/#git-commit
+ *
+ * Visibility is decided by the caller; this helper only formats the data.
+ * `hashLength` is clamped to [4, 40] upstream.
+ */
+export function formatGitCommitSegment(
+	theme: Pick<Theme, "fg">,
+	commit: GitCommitInfo | undefined,
+	config: { hashLength: number; onlyDetached: boolean; showTag: boolean },
+	colorSource: ColorSource,
+	style: ColorSpec,
+): string {
+	if (!commit?.oid) return "";
+	// Starship's only_detached hides the whole module when attached.
+	if (config.onlyDetached && !commit.detached) return "";
+	const hash = commit.oid.slice(0, config.hashLength);
+	const tag = config.showTag && commit.tag ? commit.tag : "";
+	if (!hash && !tag) return "";
+	const label = [hash, tag].filter(Boolean).join(" ");
+	return renderStyleForSource(theme, colorSource, style, label);
+}
+
+/**
+ * Starship `git_metrics` style — render `+added −deleted` line counts.
+ * See https://starship.rs/config/#git-metrics
+ *
+ * When `onlyNonzero` is true, each zero component is omitted independently
+ * and the whole segment hides at 0/0.
+ */
+export function formatGitMetricsSegment(
+	theme: Pick<Theme, "fg">,
+	metrics: GitMetricsInfo | null | undefined,
+	config: { onlyNonzero: boolean },
+	colorSource: ColorSource,
+	addedStyle: ColorSpec,
+	deletedStyle: ColorSpec,
+): string {
+	if (!metrics) return "";
+	const showAdded = !config.onlyNonzero || metrics.added > 0;
+	const showDeleted = !config.onlyNonzero || metrics.deleted > 0;
+	if (!showAdded && !showDeleted) return "";
+	const parts: string[] = [];
+	if (showAdded) {
+		parts.push(renderStyleForSource(theme, colorSource, addedStyle, `+${metrics.added}`));
+	}
+	if (showDeleted) {
+		parts.push(renderStyleForSource(theme, colorSource, deletedStyle, `−${metrics.deleted}`));
+	}
+	return parts.join(" ");
+}
 
 export type UsageTotals = {
 	input: number;
@@ -238,11 +299,96 @@ export function formatRuntimeSegment(
 	return `${renderStyleForSource(theme, colorSource, prefixStyle, "via")} ${renderStyleForSource(theme, colorSource, runtime.style, label)}`;
 }
 
-export function formatCwdLabel(cwd: string, cwdIcon: string): string {
-	const normalized = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
-	const parts = normalized.split("/").filter(Boolean);
-	const last = parts[parts.length - 1] ?? cwd;
-	return cwdIcon ? `${cwdIcon} ${last}` : last;
+/**
+ * Render the package-version segment in Starship `is <glyph> <version>` shape.
+ *
+ * Distinct from the runtime segment: this surfaces the project's own
+ * manifest version (e.g. `package.json#version`), not the installed
+ * toolchain version. Glyph comes from the Starship Nerd Font preset
+ * (https://starship.rs/presets/nerd-font); default color `208` matches
+ * the Starship `package` module default
+ * (https://starship.rs/config/#package-version).
+ */
+export function formatPackageVersionSegment(
+	theme: Pick<Theme, "fg">,
+	pkg: PackageVersionResult | undefined,
+	colorSource: ColorSource,
+	mode: IconMode = "auto",
+	configuredIcon: string = "",
+	versionStyle: ColorSpec = "208",
+): string {
+	if (!pkg) return "";
+	const icon = resolvePackageIcon(configuredIcon, mode);
+	const label = `${icon} ${pkg.version}`;
+	return `${renderStyleForSource(theme, colorSource, "", "is")} ${renderStyleForSource(theme, colorSource, versionStyle, label)}`;
+}
+
+export type FormatCwdOptions = {
+	mode?: PathDisplayMode;
+	/** Trailing directory components to keep in full mode. 0 = unlimited. */
+	depth?: number;
+	home?: string;
+};
+
+function normalizeDisplayPath(cwd: string): string {
+	const withSlashes = cwd.replace(/\\/g, "/");
+	if (withSlashes === "/" || /^\/+$/.test(withSlashes)) return "/";
+	const stripped = withSlashes.replace(/\/+$/, "");
+	return stripped === "" ? withSlashes : stripped;
+}
+
+function toHomePath(path: string, home: string): string {
+	if (!home) return path;
+	const homeNorm = home.replace(/\\/g, "/").replace(/\/+$/, "");
+	if (!homeNorm) return path;
+	if (path === homeNorm) return "~";
+	if (path.startsWith(`${homeNorm}/`)) return `~${path.slice(homeNorm.length)}`;
+	return path;
+}
+
+/** Starship-style: keep last `depth` components; prefix with `…/` when parents were dropped. */
+function applyPathDepth(path: string, depth: number): string {
+	if (!Number.isFinite(depth) || depth <= 0) return path;
+	const limit = Math.floor(depth);
+	if (path === "~" || path === "/") return path;
+
+	let components: string[];
+	if (path.startsWith("~/")) {
+		components = path.slice(2).split("/").filter(Boolean);
+	} else if (/^[A-Za-z]:\//.test(path)) {
+		components = path.slice(3).split("/").filter(Boolean);
+	} else if (path.startsWith("/")) {
+		components = path.slice(1).split("/").filter(Boolean);
+	} else {
+		components = path.split("/").filter(Boolean);
+	}
+
+	if (components.length <= limit) return path;
+	return `…/${components.slice(-limit).join("/")}`;
+}
+
+export function formatCwdLabel(cwd: string, cwdIcon: string, options?: FormatCwdOptions): string {
+	const mode = options?.mode ?? "basename";
+	const normalized = normalizeDisplayPath(cwd);
+	let pathText: string;
+	if (mode === "full") {
+		const home =
+			options?.home ??
+			(() => {
+				try {
+					return homedir();
+				} catch {
+					return "";
+				}
+			})();
+		pathText = applyPathDepth(toHomePath(normalized, home), options?.depth ?? 0);
+	} else if (normalized === "/") {
+		pathText = "/";
+	} else {
+		const parts = normalized.split("/").filter(Boolean);
+		pathText = parts[parts.length - 1] ?? cwd;
+	}
+	return cwdIcon ? `${cwdIcon} ${pathText}` : pathText;
 }
 
 export function formatUsernameHostLabel(icon: string): string {

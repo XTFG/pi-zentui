@@ -21,6 +21,8 @@ import {
 	type IconMode,
 	isExtensionStatusColorMode,
 	isExtensionStatusPlacement,
+	type PathDisplayConfig,
+	type PathDisplayMode,
 	type PolishedTuiConfig,
 	type UiFeaturesConfig,
 } from "./config";
@@ -37,6 +39,8 @@ const extensionStatusPlacementValues: ExtensionStatusPlacement[] = [
 ];
 const extensionStatusColorModeValues: ExtensionStatusColorMode[] = ["zentui", "original"];
 const contextStyleValues: ContextStyle[] = ["text", "gauge", "text+gauge"];
+const pathDisplayModeValues: PathDisplayMode[] = ["basename", "full"];
+const pathDepthValues = ["0", "1", "2", "3", "4", "5"] as const;
 const iconModeValues: IconMode[] = ["auto", "nerd", "ascii"];
 type FeatureState = "enabled" | "disabled";
 
@@ -52,7 +56,7 @@ type ColorSettingId = "starship" | "editorMessages";
 type FeatureSettingId = keyof UiFeaturesConfig;
 type FooterSegmentSettingId = keyof FooterSegmentsConfig;
 type SettingsSection = (typeof settingsSections)[number];
-type LayoutSettingId = "contextStyle" | "iconMode";
+type LayoutSettingId = "contextStyle" | "pathDisplay" | "pathDepth" | "iconMode";
 type FeatureCommandAction = "enable" | "disable" | "toggle";
 
 const featureStateValues: FeatureState[] = ["enabled", "disabled"];
@@ -83,6 +87,7 @@ type SettingsCommandDeps = {
 	setFooterFormat: (value: string) => void;
 	setIconMode: (mode: IconMode) => void;
 	setContextStyle: (style: ContextStyle) => void;
+	setPathDisplay: (patch: Partial<PathDisplayConfig>) => void;
 	getActiveExtensionStatuses: () => ReadonlyMap<string, string>;
 	setExtensionStatusPlacement: (key: string, placement: ExtensionStatusPlacement) => void;
 	setExtensionStatusColorMode: (key: string, colorMode: ExtensionStatusColorMode) => void;
@@ -130,6 +135,9 @@ const footerSegmentSettingLabels: Record<FooterSegmentSettingId, string> = {
 	context: "Context usage",
 	tokens: "Token counts",
 	cost: "Session cost",
+	packageVersion: "Package version",
+	gitCommit: "Git commit",
+	gitMetrics: "Git line metrics",
 };
 
 const footerSegmentSettingDescriptions: Record<FooterSegmentSettingId, string> = {
@@ -146,6 +154,12 @@ const footerSegmentSettingDescriptions: Record<FooterSegmentSettingId, string> =
 	context: "Show or hide context usage on the right.",
 	tokens: "Show or hide input/output token counts on the right.",
 	cost: "Show or hide session cost on the right.",
+	packageVersion:
+		"Show the project’s own manifest version (package.json, Cargo.toml, pyproject.toml, …). Distinct from the runtime segment, which shows the installed toolchain version.",
+	gitCommit:
+		"Show the current commit hash (and optional exact-match tag). On detached HEAD this provides context the branch segment can’t. Starship `git_commit`-style; default off.",
+	gitMetrics:
+		"Show aggregate added/deleted line counts (e.g. `+12 −3`) via `git diff HEAD --numstat`. Complements the git status counts. Starship `git_metrics`-style; default off.",
 };
 
 const directCommandSuggestions = [
@@ -208,7 +222,10 @@ function isFooterSegmentSettingId(value: string): value is FooterSegmentSettingI
 		value === "cost" ||
 		value === "username" ||
 		value === "time" ||
-		value === "os"
+		value === "os" ||
+		value === "packageVersion" ||
+		value === "gitCommit" ||
+		value === "gitMetrics"
 	);
 }
 
@@ -220,8 +237,21 @@ function isContextStyle(value: string): value is ContextStyle {
 	return value === "text" || value === "gauge" || value === "text+gauge";
 }
 
+function isPathDisplayMode(value: string): value is PathDisplayMode {
+	return value === "basename" || value === "full";
+}
+
+function isPathDepthValue(value: string): boolean {
+	return (pathDepthValues as readonly string[]).includes(value);
+}
+
 function isLayoutSettingId(value: string): value is LayoutSettingId {
-	return value === "contextStyle" || value === "iconMode";
+	return (
+		value === "contextStyle" ||
+		value === "pathDisplay" ||
+		value === "pathDepth" ||
+		value === "iconMode"
+	);
 }
 
 function editorMessageValue(config: PolishedTuiConfig): ColorSource | "mixed" {
@@ -373,6 +403,21 @@ function buildItems(
 				description: "Render context as text, a gauge bar, or both.",
 				currentValue: config.contextStyle,
 				values: contextStyleValues,
+			},
+			{
+				id: "pathDisplay",
+				label: "Path display",
+				description: "Show cwd as basename or full path (home contracted to ~).",
+				currentValue: config.pathDisplay.mode,
+				values: pathDisplayModeValues,
+			},
+			{
+				id: "pathDepth",
+				label: "Path depth",
+				description:
+					"In full mode, trailing directories to show (0 = all, max 5). Ignored for basename.",
+				currentValue: String(config.pathDisplay.depth),
+				values: [...pathDepthValues],
 			},
 			{
 				id: "iconMode",
@@ -584,6 +629,24 @@ export function registerZentuiSettingsCommand(pi: ExtensionAPI, deps: SettingsCo
 										settingsList.updateValue(id, newValue);
 										deps.requestRender();
 										ctx.ui.notify(`Context style: ${newValue}`, "info");
+										tui.requestRender();
+										return;
+									}
+
+									if (id === "pathDisplay" && isPathDisplayMode(newValue)) {
+										deps.setPathDisplay({ mode: newValue });
+										settingsList.updateValue(id, newValue);
+										deps.requestRender();
+										ctx.ui.notify(`Path display: ${newValue}`, "info");
+										tui.requestRender();
+										return;
+									}
+
+									if (id === "pathDepth" && isPathDepthValue(newValue)) {
+										deps.setPathDisplay({ depth: Number(newValue) });
+										settingsList.updateValue(id, newValue);
+										deps.requestRender();
+										ctx.ui.notify(`Path depth: ${newValue}`, "info");
 										tui.requestRender();
 										return;
 									}
