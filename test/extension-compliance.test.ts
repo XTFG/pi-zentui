@@ -1460,6 +1460,22 @@ describe("Pi docs compliance", () => {
 		expect(rendered).toContain("[thinkingHigh]high");
 	});
 
+	it("renders the max thinking color", () => {
+		const editor = new PolishedEditor(
+			{ requestRender() {}, terminal: { rows: 24, cols: 120 } } as never,
+			{ borderColor: (text: string) => text, selectList: {} } as never,
+			{} as never,
+			makeTaggedTheme(),
+			() => configWithColors({ editorThinking: "thinkingText", editorThinkingMax: "thinkingMax" }),
+			() => ({ modelLabel: "claude-sonnet", providerLabel: "Anthropic" }),
+			() => "max",
+		);
+
+		const rendered = editor.render(120).join("\n");
+
+		expect(rendered).toContain("[thinkingMax]max");
+	});
+
 	it("uses the shared editorThinking color when a level-specific color is absent", () => {
 		const editor = new PolishedEditor(
 			{ requestRender() {}, terminal: { rows: 24, cols: 120 } } as never,

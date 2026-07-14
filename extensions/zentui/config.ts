@@ -133,6 +133,7 @@ export type PolishedTuiConfig = {
 		editorThinkingMedium?: ColorSpec;
 		editorThinkingHigh?: ColorSpec;
 		editorThinkingXhigh?: ColorSpec;
+		editorThinkingMax?: ColorSpec;
 	};
 	colorSources: ColorSourcesConfig;
 	features: UiFeaturesConfig;
@@ -403,6 +404,7 @@ function normalizeColors(record: Record<string, unknown>): Partial<PolishedTuiCo
 		editorThinkingMedium: colorValue(record, "editorThinkingMedium"),
 		editorThinkingHigh: colorValue(record, "editorThinkingHigh"),
 		editorThinkingXhigh: colorValue(record, "editorThinkingXhigh"),
+		editorThinkingMax: colorValue(record, "editorThinkingMax"),
 	});
 }
 

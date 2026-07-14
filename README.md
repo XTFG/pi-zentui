@@ -214,7 +214,8 @@ Default config values — copy this and change any value you want:
 		"editorThinkingLow": "thinkingLow",
 		"editorThinkingMedium": "thinkingMedium",
 		"editorThinkingHigh": "thinkingHigh",
-		"editorThinkingXhigh": "thinkingXhigh"
+		"editorThinkingXhigh": "thinkingXhigh",
+		"editorThinkingMax": "thinkingMax"
 	},
 	"colorSources": {
 		"starship": "theme",
