@@ -51,6 +51,7 @@ import {
 import { applyProjectRefreshToState } from "./project-state";
 import { readRuntimeInfo } from "./runtime";
 import { installSelectorBorderStyle } from "./selector-border";
+import { SessionLifecycle } from "./session-lifecycle";
 import { registerZentuiSettingsCommand } from "./settings-command";
 import { createInitialState, type FooterState, syncState } from "./state";
 import { PolishedEditor, WrappedPolishedEditor } from "./ui";
@@ -91,6 +92,7 @@ function isTuiContext(ctx: ExtensionContext): boolean {
 
 export default function (pi: ExtensionAPI) {
 	const state: FooterState = createInitialState(emptyGitStatus());
+	const sessionLifecycle = new SessionLifecycle();
 
 	let currentConfig: PolishedTuiConfig = loadConfig();
 	let activeTheme: Theme | undefined;
@@ -108,14 +110,19 @@ export default function (pi: ExtensionAPI) {
 	let lastDurationLabel = "";
 	let lastProjectCwd: string | undefined;
 
-	const refresh = () => requestFooterRender?.();
+	const refresh = () => {
+		if (sessionLifecycle.isCurrent()) requestFooterRender?.();
+	};
 	const getActiveTheme = () => activeTheme;
 	const getCurrentConfig = () => currentConfig;
-	const getThinkingLevel = () => pi.getThinkingLevel();
+	const getThinkingLevel = () =>
+		sessionLifecycle.isCurrent() ? pi.getThinkingLevel() : ("off" as const);
 	const syncFooterState = (ctx: ExtensionContext) =>
 		syncState(state, ctx, currentConfig.icons.cacheHit);
 
-	const refreshProjectState = async (ctx: ExtensionContext) => {
+	type ProjectRefreshTarget = { cwd: string; generation: number };
+	const refreshProjectState = async ({ cwd, generation }: ProjectRefreshTarget) => {
+		if (!sessionLifecycle.isCurrent(generation)) return;
 		const gitCommitConfig = currentConfig.gitCommit;
 		const gitMetricsConfig = currentConfig.gitMetrics;
 		const segments = currentConfig.footerSegments;
@@ -132,16 +139,17 @@ export default function (pi: ExtensionAPI) {
 		const wantMetrics = segments.gitMetrics || formatNeedsMetrics;
 		const wantPackage = segments.packageVersion || formatNeedsPackage;
 		const [git, runtime, packageVersion] = await Promise.all([
-			readGitStatus(ctx.cwd, {
+			readGitStatus(cwd, {
 				readExactTag: wantExactTag,
 				readMetrics: wantMetrics,
 				ignoreSubmodules: gitMetricsConfig.ignoreSubmodules,
 			}),
-			readRuntimeInfo(ctx.cwd),
-			wantPackage ? readPackageVersionResult(ctx.cwd) : Promise.resolve(undefined),
+			readRuntimeInfo(cwd),
+			wantPackage ? readPackageVersionResult(cwd) : Promise.resolve(undefined),
 		]);
+		if (!sessionLifecycle.isCurrent(generation)) return;
 		lastProjectCwd = applyProjectRefreshToState(state, {
-			cwd: ctx.cwd,
+			cwd,
 			previousCwd: lastProjectCwd,
 			git,
 			runtime,
@@ -150,11 +158,18 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const projectRefreshScheduler = createProjectRefreshScheduler(refreshProjectState, refresh);
-	const scheduleProjectRefresh = (ctx: ExtensionContext, options?: ScheduleProjectRefreshOptions) =>
-		projectRefreshScheduler.schedule(ctx, options);
+	const scheduleProjectRefresh = (
+		ctx: ExtensionContext,
+		options?: ScheduleProjectRefreshOptions,
+	) => {
+		const generation = sessionLifecycle.currentGeneration();
+		if (!sessionLifecycle.isCurrent(generation)) return;
+		const cwd = ctx.cwd;
+		projectRefreshScheduler.schedule({ cwd, generation }, options);
+	};
 
 	const refreshInteractiveState = (ctx: ExtensionContext, project = false) => {
-		if (!ctx.hasUI) return;
+		if (!sessionLifecycle.isCurrent() || !ctx.hasUI) return;
 		syncFooterState(ctx);
 		if (project && currentConfig.features.statusLine) scheduleProjectRefresh(ctx);
 		refresh();
@@ -170,6 +185,7 @@ export default function (pi: ExtensionAPI) {
 		stopSessionTimer();
 		lastDurationLabel = "";
 		const timer = setInterval(() => {
+			if (!sessionLifecycle.isCurrent()) return;
 			const segments = currentConfig.footerSegments;
 			const formatNeedsTimer =
 				currentConfig.footerFormat &&
@@ -216,12 +232,13 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const makeEditorFactory = (ctx: ExtensionContext): ZentuiEditorFactory => {
+		const sessionTheme = ctx.ui.theme;
 		const factory = ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) =>
 			new PolishedEditor(
 				tui,
 				theme,
 				keybindings,
-				ctx.ui.theme,
+				sessionTheme,
 				getCurrentConfig,
 				() => ({
 					modelLabel: state.modelLabel,
@@ -237,10 +254,11 @@ export default function (pi: ExtensionAPI) {
 		ctx: ExtensionContext,
 		baseFactory: EditorFactory,
 	): ZentuiEditorFactory => {
+		const sessionTheme = ctx.ui.theme;
 		const factory = ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) =>
 			new WrappedPolishedEditor(
 				baseFactory(tui, theme, keybindings),
-				ctx.ui.theme,
+				sessionTheme,
 				getCurrentConfig,
 				() => ({
 					modelLabel: state.modelLabel,
@@ -365,50 +383,54 @@ export default function (pi: ExtensionAPI) {
 		stopProjectRefresh();
 		applyConfiguredUi(ctx);
 		if (currentConfig.fixedEditor?.enabled) {
-			installFixedEditorProbe(ctx, getCurrentConfig);
+			installFixedEditorProbe(ctx, getCurrentConfig, sessionLifecycle);
 		}
 		refresh();
 	};
 
 	const scheduleEditorReconciliation = (ctx: ExtensionContext) => {
-		setTimeout(() => {
+		sessionLifecycle.defer(() => {
 			if (!isTuiContext(ctx) || !currentConfig.features.editor) return;
 			const currentFactory = ctx.ui.getEditorComponent();
 			if (currentFactory && currentFactory !== installedEditorFactory) {
 				applyConfiguredUi(ctx);
 				refresh();
 			}
-		}, 0);
+		});
 	};
 
 	const cleanupUi = (ctx?: ExtensionContext) => {
-		disposeFixedEditor();
-		if (ctx && isTuiContext(ctx)) {
-			removeFixedEditorProbe(ctx);
-		}
-		uninstallPrototypePatches();
-		stopSessionTimer();
-		stopProjectRefresh();
-		requestFooterRender = undefined;
-		getActiveExtensionStatuses = () => new Map();
-		if (ctx && isTuiContext(ctx)) {
-			ctx.ui.setFooter(undefined);
-			const currentFactory = ctx.ui.getEditorComponent();
-			if (!currentFactory || isZentuiEditorFactory(currentFactory)) {
-				ctx.ui.setEditorComponent(
-					getZentuiEditorBaseFactory(currentFactory) ??
-						(editorInstallMode === "wrapper" && wrappedEditorFactory
-							? wrappedEditorFactory
-							: undefined),
-				);
+		if (!ctx || !sessionLifecycle.isCurrent()) return;
+		sessionLifecycle.shutdown();
+		try {
+			disposeFixedEditor(ctx);
+			if (isTuiContext(ctx)) removeFixedEditorProbe(ctx);
+			uninstallPrototypePatches();
+			stopSessionTimer();
+			stopProjectRefresh();
+			requestFooterRender = undefined;
+			getActiveExtensionStatuses = () => new Map();
+			if (isTuiContext(ctx)) {
+				ctx.ui.setFooter(undefined);
+				const currentFactory = ctx.ui.getEditorComponent();
+				if (!currentFactory || isZentuiEditorFactory(currentFactory)) {
+					ctx.ui.setEditorComponent(
+						getZentuiEditorBaseFactory(currentFactory) ??
+							(editorInstallMode === "wrapper" && wrappedEditorFactory
+								? wrappedEditorFactory
+								: undefined),
+					);
+				}
 			}
+			wrappedEditorFactory = undefined;
+			installedEditorFactory = undefined;
+			editorInstallMode = "none";
+			footerInstalled = false;
+			editorInstalled = false;
+			activeTheme = undefined;
+		} finally {
+			requestFooterRender = undefined;
 		}
-		wrappedEditorFactory = undefined;
-		installedEditorFactory = undefined;
-		editorInstallMode = "none";
-		footerInstalled = false;
-		editorInstalled = false;
-		activeTheme = undefined;
 	};
 
 	const syncInteractiveState = (_event: unknown, ctx: ExtensionContext) => {
@@ -419,6 +441,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		sessionLifecycle.start();
 		state.sessionStartEpoch = Date.now();
 		invalidateUsageTotalsCache();
 		lastProjectCwd = undefined;
@@ -427,6 +450,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	registerZentuiSettingsCommand(pi, {
+		sessionLifecycle,
 		getConfig: getCurrentConfig,
 		setColorSources(patch: Partial<ColorSourcesConfig>) {
 			currentConfig = saveColorSourcesPatch(patch);
@@ -474,9 +498,9 @@ export default function (pi: ExtensionAPI) {
 		setFixedEditor(patch: Partial<FixedEditorConfig>, ctx: ExtensionContext) {
 			currentConfig = saveFixedEditorPatch(patch);
 			if (patch.enabled === true) {
-				installFixedEditorProbe(ctx, getCurrentConfig);
+				installFixedEditorProbe(ctx, getCurrentConfig, sessionLifecycle);
 			} else if (patch.enabled === false) {
-				disposeFixedEditor();
+				disposeFixedEditor(ctx);
 			}
 			refresh();
 		},

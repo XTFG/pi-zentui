@@ -12,23 +12,25 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 
 import type { PolishedTuiConfig } from "../config";
+import type { SessionLifecycle } from "../session-lifecycle";
 import { renderStyleForSourceOrFallback } from "../style";
 import { TerminalSplitCompositor } from "./compositor";
-import type { TuiLike } from "./types";
+import { inspectPiTui } from "./pi-compat";
 
 let compositor: TerminalSplitCompositor | null = null;
 let didWarnUnsupported = false;
 let copyNoticeTimer: ReturnType<typeof setTimeout> | null = null;
 let storedCtx: ExtensionContext | null = null;
+let cancelProbeInstall: (() => void) | null = null;
 const COPY_NOTICE_KEY = "zentui-copy-notice";
 const COPY_NOTICE_MS = 2500;
 
 function clearCopyNotice(ctx: ExtensionContext): void {
-	if (!ctx.hasUI || typeof ctx.ui.setWidget !== "function") return;
 	if (copyNoticeTimer) {
 		clearTimeout(copyNoticeTimer);
 		copyNoticeTimer = null;
 	}
+	if (!ctx.hasUI || typeof ctx.ui.setWidget !== "function") return;
 	ctx.ui.setWidget(COPY_NOTICE_KEY, undefined);
 }
 
@@ -80,8 +82,10 @@ function showCopyNotice(ctx: ExtensionContext, getConfig: () => PolishedTuiConfi
 	});
 	if (copyNoticeTimer) clearTimeout(copyNoticeTimer);
 	copyNoticeTimer = setTimeout(() => {
-		ctx.ui.setWidget(COPY_NOTICE_KEY, undefined);
 		copyNoticeTimer = null;
+		if (storedCtx !== ctx) return;
+		if (!ctx.hasUI || typeof ctx.ui.setWidget !== "function") return;
+		ctx.ui.setWidget(COPY_NOTICE_KEY, undefined);
 	}, COPY_NOTICE_MS);
 }
 
@@ -99,7 +103,7 @@ class ProbeComponent implements Component {
 	render(): string[] {
 		if (!this.hasQueuedInstall) {
 			this.hasQueuedInstall = true;
-			queueMicrotask(this.onInstall);
+			this.onInstall();
 		}
 		return [];
 	}
@@ -123,34 +127,36 @@ function installFromProbe(
 	getConfig: () => PolishedTuiConfig,
 ): void {
 	if (compositor) return;
-	const config = getConfig();
-	if (!config.fixedEditor?.enabled) return;
+	try {
+		const config = getConfig();
+		if (!config.fixedEditor?.enabled) return;
 
-	const tuiLike = tui as unknown as TuiLike;
-	const terminal = tuiLike.terminal;
-	if (!terminal || typeof terminal.write !== "function") {
+		const capabilities = inspectPiTui(tui);
+		if (!capabilities) {
+			warnUnsupported(ctx);
+			return;
+		}
+
+		const next = new TerminalSplitCompositor(
+			capabilities,
+			() => ({
+				enabled: getConfig().fixedEditor?.enabled ?? false,
+				mouseScroll: getConfig().fixedEditor?.mouseScroll ?? false,
+				copyNotice: getConfig().fixedEditor?.copyNotice ?? true,
+			}),
+			ctx.hasUI ? () => showCopyNotice(ctx, getConfig) : undefined,
+			ctx.hasUI ? () => clearCopyNotice(ctx) : undefined,
+		);
+
+		if (!next.install()) {
+			warnUnsupported(ctx);
+			return;
+		}
+
+		compositor = next;
+	} catch {
 		warnUnsupported(ctx);
-		return;
 	}
-
-	const next = new TerminalSplitCompositor(
-		tuiLike,
-		terminal,
-		() => ({
-			enabled: getConfig().fixedEditor?.enabled ?? false,
-			mouseScroll: getConfig().fixedEditor?.mouseScroll ?? false,
-			copyNotice: getConfig().fixedEditor?.copyNotice ?? true,
-		}),
-		ctx.hasUI ? () => showCopyNotice(ctx, getConfig) : undefined,
-		ctx.hasUI ? () => clearCopyNotice(ctx) : undefined,
-	);
-
-	if (!next.install()) {
-		warnUnsupported(ctx);
-		return;
-	}
-
-	compositor = next;
 }
 
 const WIDGET_KEY = "zentui-fixed-editor-probe";
@@ -163,17 +169,25 @@ const WIDGET_KEY = "zentui-fixed-editor-probe";
 export function installFixedEditorProbe(
 	ctx: ExtensionContext,
 	getConfig: () => PolishedTuiConfig,
+	lifecycle: SessionLifecycle,
 ): void {
-	if (!ctx.hasUI) return;
+	if (!lifecycle.isCurrent() || !ctx.hasUI) return;
 	if (typeof ctx.ui.setWidget !== "function") return;
 	didWarnUnsupported = false;
 	storedCtx = ctx;
+	cancelProbeInstall?.();
+	cancelProbeInstall = null;
 
 	ctx.ui.setWidget(
 		WIDGET_KEY,
 		(tui: TUI) =>
 			new ProbeComponent(() => {
-				queueMicrotask(() => installFromProbe(ctx, tui, getConfig));
+				cancelProbeInstall = lifecycle.queueMicrotask(() => {
+					cancelProbeInstall = lifecycle.queueMicrotask(() => {
+						cancelProbeInstall = null;
+						installFromProbe(ctx, tui, getConfig);
+					});
+				});
 			}),
 		{ placement: "aboveEditor" },
 	);
@@ -183,16 +197,17 @@ export function installFixedEditorProbe(
  * Dispose the compositor if active.
  * Call from session_shutdown and cleanupUi.
  */
-export function disposeFixedEditor(): void {
+export function disposeFixedEditor(ctx?: ExtensionContext): void {
+	cancelProbeInstall?.();
+	cancelProbeInstall = null;
 	compositor?.dispose();
 	compositor = null;
 	if (copyNoticeTimer) {
 		clearTimeout(copyNoticeTimer);
 		copyNoticeTimer = null;
 	}
-	if (storedCtx) {
-		clearCopyNotice(storedCtx);
-	}
+	storedCtx = null;
+	if (ctx) clearCopyNotice(ctx);
 }
 
 /**
@@ -200,6 +215,8 @@ export function disposeFixedEditor(): void {
  * Useful for full UI cleanup.
  */
 export function removeFixedEditorProbe(ctx: ExtensionContext): void {
+	cancelProbeInstall?.();
+	cancelProbeInstall = null;
 	if (!ctx.hasUI) return;
 	if (typeof ctx.ui.setWidget !== "function") return;
 	ctx.ui.setWidget(WIDGET_KEY, undefined);

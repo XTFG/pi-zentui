@@ -1,4 +1,17 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	readlinkSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -6,6 +19,7 @@ import {
 	defaultConfig,
 	mergeConfig,
 	saveColorSourcesPatch,
+	saveContextThresholdsPatch,
 	saveExtensionStatusColorMode,
 	saveExtensionStatusPlacement,
 	saveFixedEditorPatch,
@@ -23,6 +37,12 @@ import {
 	renderStyleForSource,
 	renderTerminalStyle,
 } from "../extensions/zentui/style";
+
+function configTempFiles(dir: string, filename = "zentui.json"): string[] {
+	return readdirSync(dir).filter(
+		(name) => name.startsWith(`.${filename}.`) && name.endsWith(".tmp"),
+	);
+}
 
 describe("mergeConfig", () => {
 	it("defaults project refresh polling to 30 seconds and Starship styles", () => {
@@ -172,6 +192,153 @@ describe("mergeConfig", () => {
 				contextStyle: "gauge",
 				separator: "chevron",
 			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses corrupt config without changing its bytes", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		const original = "{ invalid json\n";
+		try {
+			writeFileSync(path, original);
+
+			expect(() => saveSeparatorPatch("dot", path)).toThrow(
+				/Refusing to save Zentui config.*corrupt/,
+			);
+			expect(readFileSync(path, "utf8")).toBe(original);
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("creates missing config atomically and returns the config written to disk", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		try {
+			expect(existsSync(path)).toBe(false);
+			const config = saveFooterFormatPatch("$cwd $fill $context", path);
+			const raw = JSON.parse(readFileSync(path, "utf8"));
+
+			expect(raw).toEqual({ footerFormat: "$cwd $fill $context" });
+			expect(config).toEqual(mergeConfig(raw));
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves the existing destination mode during atomic replacement", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		try {
+			writeFileSync(path, `${JSON.stringify({ separator: "pipe" }, null, 2)}\n`);
+			chmodSync(path, 0o600);
+
+			saveSeparatorPatch("dot", path);
+
+			expect(statSync(path).mode & 0o777).toBe(0o600);
+			expect(JSON.parse(readFileSync(path, "utf8")).separator).toBe("dot");
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("updates a symlink target atomically without replacing the symlink", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const targetDir = join(dir, "target");
+		const targetPath = join(targetDir, "actual.json");
+		const linkPath = join(dir, "zentui.json");
+		try {
+			mkdirSync(targetDir);
+			writeFileSync(targetPath, `${JSON.stringify({ unknown: true }, null, 2)}\n`);
+			chmodSync(targetPath, 0o600);
+			symlinkSync(targetPath, linkPath);
+			const originalLink = readlinkSync(linkPath);
+
+			const config = saveSeparatorPatch("chevron", linkPath);
+			const raw = JSON.parse(readFileSync(targetPath, "utf8"));
+
+			expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
+			expect(readlinkSync(linkPath)).toBe(originalLink);
+			expect(raw).toEqual({ unknown: true, separator: "chevron" });
+			expect(config).toEqual(mergeConfig(raw));
+			expect(statSync(targetPath).mode & 0o777).toBe(0o600);
+			expect(configTempFiles(targetDir, "actual.json")).toEqual([]);
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a dangling symlink without changing it", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const targetDir = join(dir, "target");
+		const missingTarget = join(targetDir, "missing.json");
+		const linkPath = join(dir, "zentui.json");
+		try {
+			mkdirSync(targetDir);
+			symlinkSync(missingTarget, linkPath);
+			const originalLink = readlinkSync(linkPath);
+
+			expect(() => saveSeparatorPatch("dot", linkPath)).toThrow(/Refusing to save Zentui config/);
+			expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
+			expect(readlinkSync(linkPath)).toBe(originalLink);
+			expect(existsSync(missingTarget)).toBe(false);
+			expect(configTempFiles(targetDir, "missing.json")).toEqual([]);
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves scalar and nested unknown keys through the shared mutation path", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		try {
+			writeFileSync(
+				path,
+				`${JSON.stringify(
+					{
+						futureScalar: "keep",
+						pathDisplay: { mode: "basename", depth: 2, futureNested: { keep: true } },
+					},
+					null,
+					2,
+				)}\n`,
+			);
+
+			saveSeparatorPatch("dot", path);
+			const config = savePathDisplayPatch({ mode: "full" }, path);
+			const raw = JSON.parse(readFileSync(path, "utf8"));
+
+			expect(raw.futureScalar).toBe("keep");
+			expect(raw.separator).toBe("dot");
+			expect(raw.pathDisplay).toEqual({
+				mode: "full",
+				depth: 2,
+				futureNested: { keep: true },
+			});
+			expect(config).toEqual(mergeConfig(raw));
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the destination and removes the temp file when serialization fails", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		const original = `${JSON.stringify({ unknown: true }, null, 2)}\n`;
+		try {
+			writeFileSync(path, original);
+
+			expect(() => saveContextThresholdsPatch({ warning: 1n as never }, path)).toThrow();
+			expect(readFileSync(path, "utf8")).toBe(original);
+			expect(configTempFiles(dir)).toEqual([]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

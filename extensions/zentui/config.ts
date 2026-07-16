@@ -1,5 +1,19 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import {
+	closeSync,
+	existsSync,
+	fchmodSync,
+	fsyncSync,
+	lstatSync,
+	openSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
 	ICON_GLYPH_KEYS,
@@ -623,14 +637,83 @@ function validFooterSegmentEntries(record: Record<string, unknown>): Partial<Foo
 	) as Partial<FooterSegmentsConfig>;
 }
 
-function readConfigRecord(path = configPath): ConfigRecord {
+type ConfigFileState =
+	| { kind: "missing"; record: ConfigRecord; writePath: string }
+	| { kind: "valid"; record: ConfigRecord; writePath: string; mode: number }
+	| { kind: "corrupt"; error: unknown };
+
+function errorCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error
+		? String(error.code)
+		: undefined;
+}
+
+function readConfigFileState(path: string): ConfigFileState {
+	let writePath = path;
 	try {
-		if (!existsSync(path)) return {};
-		const parsed = JSON.parse(readFileSync(path, "utf8"));
-		return isRecord(parsed) ? parsed : {};
-	} catch {
-		return {};
+		const pathStat = lstatSync(path);
+		if (pathStat.isSymbolicLink()) writePath = realpathSync(path);
+		const targetStat = statSync(writePath);
+		const parsed = JSON.parse(readFileSync(writePath, "utf8"));
+		return isRecord(parsed)
+			? { kind: "valid", record: parsed, writePath, mode: targetStat.mode & 0o7777 }
+			: { kind: "corrupt", error: new Error("top-level value must be a JSON object") };
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") {
+			try {
+				lstatSync(path);
+			} catch (pathError) {
+				if (errorCode(pathError) === "ENOENT")
+					return { kind: "missing", record: {}, writePath: path };
+			}
+		}
+		return { kind: "corrupt", error };
 	}
+}
+
+function writeConfigAtomically(path: string, record: ConfigRecord, mode?: number): void {
+	const tempPath = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+	let file: number | undefined;
+	try {
+		file = openSync(tempPath, "wx", mode ?? 0o666);
+		if (mode !== undefined) fchmodSync(file, mode);
+		writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+		fsyncSync(file);
+		closeSync(file);
+		file = undefined;
+		renameSync(tempPath, path);
+	} catch (error) {
+		if (file !== undefined) {
+			try {
+				closeSync(file);
+			} catch {}
+		}
+		try {
+			unlinkSync(tempPath);
+		} catch (cleanupError) {
+			if (errorCode(cleanupError) !== "ENOENT") {
+				// Preserve the persistence failure; the best-effort cleanup error is secondary.
+			}
+		}
+		throw error;
+	}
+}
+
+function mutateConfig(path: string, mutate: (record: ConfigRecord) => void): PolishedTuiConfig {
+	const state = readConfigFileState(path);
+	if (state.kind === "corrupt") {
+		const detail = state.error instanceof Error ? ` (${state.error.message})` : "";
+		throw new Error(
+			`Refusing to save Zentui config because ${path} is corrupt or unreadable; fix or remove it first.${detail}`,
+		);
+	}
+	mutate(state.record);
+	writeConfigAtomically(
+		state.writePath,
+		state.record,
+		state.kind === "valid" ? state.mode : undefined,
+	);
+	return mergeConfig(state.record);
 }
 
 export function ensureConfigExists(): void {
@@ -724,129 +807,119 @@ export function saveColorSourcesPatch(
 	patch: Partial<ColorSourcesConfig>,
 	path = configPath,
 ): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	const existing = isRecord(record.colorSources)
-		? { ...(record.colorSources as Record<string, unknown>) }
-		: {};
-	record.colorSources = {
-		...existing,
-		...validColorSourceEntries(patch),
-	};
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		const existing = isRecord(record.colorSources)
+			? { ...(record.colorSources as Record<string, unknown>) }
+			: {};
+		record.colorSources = {
+			...existing,
+			...validColorSourceEntries(patch),
+		};
+	});
 }
 
 export function saveUiFeaturesPatch(
 	patch: Partial<UiFeaturesConfig>,
 	path = configPath,
 ): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	const existing = isRecord(record.features)
-		? { ...(record.features as Record<string, unknown>) }
-		: {};
-	record.features = {
-		...existing,
-		...validUiFeatureEntries(patch),
-	};
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		const existing = isRecord(record.features)
+			? { ...(record.features as Record<string, unknown>) }
+			: {};
+		record.features = {
+			...existing,
+			...validUiFeatureEntries(patch),
+		};
+	});
 }
 
 export function saveFooterSegmentsPatch(
 	patch: Partial<FooterSegmentsConfig>,
 	path = configPath,
 ): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	const existing = isRecord(record.footerSegments)
-		? { ...(record.footerSegments as Record<string, unknown>) }
-		: {};
-	record.footerSegments = {
-		...existing,
-		...validFooterSegmentEntries(patch),
-	};
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		const existing = isRecord(record.footerSegments)
+			? { ...(record.footerSegments as Record<string, unknown>) }
+			: {};
+		record.footerSegments = {
+			...existing,
+			...validFooterSegmentEntries(patch),
+		};
+	});
 }
 
 export function saveFooterFormatPatch(value: string, path = configPath): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	record.footerFormat = typeof value === "string" ? value : "";
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		record.footerFormat = typeof value === "string" ? value : "";
+	});
 }
 
 export function saveIconsModePatch(mode: IconMode, path = configPath): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	const existing = isRecord(record.icons) ? { ...(record.icons as Record<string, unknown>) } : {};
-	record.icons = {
-		...existing,
-		mode: normalizeIconMode(mode),
-	};
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		const existing = isRecord(record.icons) ? { ...(record.icons as Record<string, unknown>) } : {};
+		record.icons = {
+			...existing,
+			mode: normalizeIconMode(mode),
+		};
+	});
 }
 
 export function saveContextStylePatch(style: ContextStyle, path = configPath): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	record.contextStyle = parseContextStyle(style);
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		record.contextStyle = parseContextStyle(style);
+	});
 }
 
 export function saveSeparatorPatch(
 	separator: SeparatorStyle,
 	path = configPath,
 ): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	record.separator = parseSeparatorStyle(separator);
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		record.separator = parseSeparatorStyle(separator);
+	});
 }
 
 export function saveContextThresholdsPatch(
 	thresholds: Partial<ContextThresholds>,
 	path = configPath,
 ): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	const existing = isRecord(record.contextThresholds)
-		? { ...(record.contextThresholds as Record<string, unknown>) }
-		: {};
-	record.contextThresholds = {
-		...existing,
-		...thresholds,
-	};
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		const existing = isRecord(record.contextThresholds)
+			? { ...(record.contextThresholds as Record<string, unknown>) }
+			: {};
+		record.contextThresholds = {
+			...existing,
+			...thresholds,
+		};
+	});
 }
 
 export function savePathDisplayPatch(
 	patch: Partial<PathDisplayConfig>,
 	path = configPath,
 ): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	const existing = isRecord(record.pathDisplay)
-		? { ...(record.pathDisplay as Record<string, unknown>) }
-		: {};
-	if (patch.mode !== undefined) existing.mode = patch.mode;
-	if (patch.depth !== undefined) existing.depth = patch.depth;
-	record.pathDisplay = existing;
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		const existing = isRecord(record.pathDisplay)
+			? { ...(record.pathDisplay as Record<string, unknown>) }
+			: {};
+		if (patch.mode !== undefined) existing.mode = patch.mode;
+		if (patch.depth !== undefined) existing.depth = patch.depth;
+		record.pathDisplay = existing;
+	});
 }
 
 export function saveGitBranchPatch(
 	patch: Partial<GitBranchConfig>,
 	path = configPath,
 ): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	const existing = isRecord(record.gitBranch)
-		? { ...(record.gitBranch as Record<string, unknown>) }
-		: {};
-	if (patch.maxLength !== undefined)
-		existing.maxLength = normalizeGitBranchMaxLength(patch.maxLength);
-	record.gitBranch = existing;
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		const existing = isRecord(record.gitBranch)
+			? { ...(record.gitBranch as Record<string, unknown>) }
+			: {};
+		if (patch.maxLength !== undefined)
+			existing.maxLength = normalizeGitBranchMaxLength(patch.maxLength);
+		record.gitBranch = existing;
+	});
 }
 
 export function saveExtensionStatusPlacement(
@@ -854,27 +927,26 @@ export function saveExtensionStatusPlacement(
 	placement: ExtensionStatusPlacement,
 	path = configPath,
 ): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	const existingExtensionStatuses = isRecord(record.extensionStatuses)
-		? { ...(record.extensionStatuses as Record<string, unknown>) }
-		: {};
-	const existingPlacements = isRecord(existingExtensionStatuses.placements)
-		? { ...(existingExtensionStatuses.placements as Record<string, unknown>) }
-		: {};
+	return mutateConfig(path, (record) => {
+		const existingExtensionStatuses = isRecord(record.extensionStatuses)
+			? { ...(record.extensionStatuses as Record<string, unknown>) }
+			: {};
+		const existingPlacements = isRecord(existingExtensionStatuses.placements)
+			? { ...(existingExtensionStatuses.placements as Record<string, unknown>) }
+			: {};
 
-	Object.defineProperty(existingPlacements, key, {
-		value: placement,
-		enumerable: true,
-		configurable: true,
-		writable: true,
+		Object.defineProperty(existingPlacements, key, {
+			value: placement,
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
+
+		record.extensionStatuses = {
+			...existingExtensionStatuses,
+			placements: existingPlacements,
+		};
 	});
-
-	record.extensionStatuses = {
-		...existingExtensionStatuses,
-		placements: existingPlacements,
-	};
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
 }
 
 export function saveExtensionStatusColorMode(
@@ -882,43 +954,41 @@ export function saveExtensionStatusColorMode(
 	colorMode: ExtensionStatusColorMode,
 	path = configPath,
 ): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	const existingExtensionStatuses = isRecord(record.extensionStatuses)
-		? { ...(record.extensionStatuses as Record<string, unknown>) }
-		: {};
-	const existingColorModes = isRecord(existingExtensionStatuses.colorModes)
-		? { ...(existingExtensionStatuses.colorModes as Record<string, unknown>) }
-		: {};
+	return mutateConfig(path, (record) => {
+		const existingExtensionStatuses = isRecord(record.extensionStatuses)
+			? { ...(record.extensionStatuses as Record<string, unknown>) }
+			: {};
+		const existingColorModes = isRecord(existingExtensionStatuses.colorModes)
+			? { ...(existingExtensionStatuses.colorModes as Record<string, unknown>) }
+			: {};
 
-	Object.defineProperty(existingColorModes, key, {
-		value: colorMode,
-		enumerable: true,
-		configurable: true,
-		writable: true,
+		Object.defineProperty(existingColorModes, key, {
+			value: colorMode,
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
+
+		record.extensionStatuses = {
+			...existingExtensionStatuses,
+			colorModes: existingColorModes,
+		};
 	});
-
-	record.extensionStatuses = {
-		...existingExtensionStatuses,
-		colorModes: existingColorModes,
-	};
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
 }
 
 export function saveFixedEditorPatch(
 	patch: Partial<FixedEditorConfig>,
 	path = configPath,
 ): PolishedTuiConfig {
-	const record = readConfigRecord(path);
-	const existing = isRecord(record.fixedEditor)
-		? { ...(record.fixedEditor as Record<string, unknown>) }
-		: {};
-	record.fixedEditor = {
-		...existing,
-		...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
-		...(patch.mouseScroll !== undefined ? { mouseScroll: patch.mouseScroll } : {}),
-		...(patch.copyNotice !== undefined ? { copyNotice: patch.copyNotice } : {}),
-	};
-	writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-	return mergeConfig(record);
+	return mutateConfig(path, (record) => {
+		const existing = isRecord(record.fixedEditor)
+			? { ...(record.fixedEditor as Record<string, unknown>) }
+			: {};
+		record.fixedEditor = {
+			...existing,
+			...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+			...(patch.mouseScroll !== undefined ? { mouseScroll: patch.mouseScroll } : {}),
+			...(patch.copyNotice !== undefined ? { copyNotice: patch.copyNotice } : {}),
+		};
+	});
 }
