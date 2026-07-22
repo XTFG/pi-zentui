@@ -2,7 +2,11 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { PolishedTuiConfig, SeparatorStyle } from "./config";
 import { FOOTER_FORMAT_ALIASES } from "./config";
-import { collectExtensionStatusSegments, type ExtensionStatusSegment } from "./extension-status";
+import {
+	collectExtensionStatusSegments,
+	type ExtensionStatusSegment,
+	sanitizeExtensionStatusText,
+} from "./extension-status";
 import { parseFooterFormat, renderFormatSplit, stripOrphanSeparators } from "./footer-format";
 import {
 	buildContextDisplayLabel,
@@ -195,6 +199,16 @@ export function installFooter(
 						depth: config.pathDisplay.depth,
 					}),
 				);
+				const needsSessionName = config.footerFormat
+					? /(?:\$session_name\b|\$\{session_name\})/.test(config.footerFormat)
+					: config.footerSegments.sessionName;
+				const sessionName = needsSessionName
+					? sanitizeExtensionStatusText(ctx.sessionManager.getSessionName() ?? "")
+					: "";
+				const sessionNameLabel = sessionName
+					? renderStyleForSource(theme, colorSource, config.colors.sessionName, sessionName)
+					: "";
+				const builtInSessionNameLabel = sessionNameLabel ? `in ${sessionNameLabel}` : "";
 				const branch = state.branch;
 				const branchText = branch
 					? formatGitBranchText(branch, config.gitBranch.maxLength)
@@ -263,6 +277,8 @@ export function installFooter(
 					switch (canonical) {
 						case "cwd":
 							return cwdLabel;
+						case "session_name":
+							return sessionNameLabel;
 						case "git_branch":
 							return branchText
 								? gitIcon
@@ -491,6 +507,7 @@ export function installFooter(
 					osSegment,
 					usernameSegment,
 					config.footerSegments.cwd ? cwdLabel : "",
+					config.footerSegments.sessionName ? builtInSessionNameLabel : "",
 					branchLabel,
 					gitCommitLabel,
 					gitMetricsLabel,
