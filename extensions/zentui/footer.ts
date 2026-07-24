@@ -1,14 +1,19 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { PolishedTuiConfig } from "./config";
+import type { PolishedTuiConfig, SeparatorStyle } from "./config";
 import { FOOTER_FORMAT_ALIASES } from "./config";
-import { collectExtensionStatusSegments, type ExtensionStatusSegment } from "./extension-status";
+import {
+	collectExtensionStatusSegments,
+	type ExtensionStatusSegment,
+	sanitizeExtensionStatusText,
+} from "./extension-status";
 import { parseFooterFormat, renderFormatSplit, stripOrphanSeparators } from "./footer-format";
 import {
 	buildContextDisplayLabel,
 	buildSessionDurationLabel,
 	contextColorTier,
 	formatCwdLabel,
+	formatGitBranchText,
 	formatGitCommitSegment,
 	formatGitMetricsSegment,
 	formatOsLabel,
@@ -18,8 +23,16 @@ import {
 	formatUsernameHostLabel,
 } from "./format";
 import { resolveRuntimeSymbol } from "./icons";
+import type { LiveContextOverride } from "./live-context";
 import type { FooterState } from "./state";
 import { renderStyleForSource } from "./style";
+
+const separatorText: Record<SeparatorStyle, string> = {
+	pipe: " | ",
+	dot: " · ",
+	chevron: " › ",
+	none: " ",
+};
 
 function joinStatusTexts(statusTexts: string[], separator: string): string {
 	return statusTexts.filter(Boolean).join(separator);
@@ -147,6 +160,7 @@ export function installFooter(
 		setRequestRender: (fn: (() => void) | undefined) => void;
 		scheduleProjectRefresh: (ctx: ExtensionContext) => void;
 		setExtensionStatusesGetter?: (fn: (() => ReadonlyMap<string, string>) | undefined) => void;
+		getLiveContext?: () => LiveContextOverride | undefined;
 	},
 ): void {
 	ctx.ui.setFooter((tui, theme, footerData) => {
@@ -169,7 +183,12 @@ export function installFooter(
 				const config = getConfig();
 				const colorSource = config.colorSources.starship;
 				const iconMode = config.icons.mode;
-				const separator = renderStyleForSource(theme, colorSource, config.colors.separator, " | ");
+				const separator = renderStyleForSource(
+					theme,
+					colorSource,
+					config.colors.separator,
+					separatorText[config.separator],
+				);
 				const innerWidth = Math.max(1, width - 2);
 				const cwdLabel = renderStyleForSource(
 					theme,
@@ -180,16 +199,35 @@ export function installFooter(
 						depth: config.pathDisplay.depth,
 					}),
 				);
+				const needsSessionName = config.footerFormat
+					? /(?:\$session_name\b|\$\{session_name\})/.test(config.footerFormat)
+					: config.footerSegments.sessionName;
+				const sessionName = needsSessionName
+					? sanitizeExtensionStatusText(ctx.sessionManager.getSessionName() ?? "")
+					: "";
+				const sessionNameLabel = sessionName
+					? renderStyleForSource(theme, colorSource, config.colors.sessionName, sessionName)
+					: "";
+				const builtInSessionNameLabel = sessionNameLabel ? `in ${sessionNameLabel}` : "";
 				const branch = state.branch;
+				const branchText = branch
+					? formatGitBranchText(branch, config.gitBranch.maxLength)
+					: undefined;
 				const contextUsage = ctx.getContextUsage();
+				const liveContext = hooks.getLiveContext?.();
 				const contextWindow = ctx.model?.contextWindow ?? contextUsage?.contextWindow;
+				const useLiveContext =
+					liveContext !== undefined && contextWindow !== undefined && contextWindow > 0;
+				const contextPercent = useLiveContext
+					? (liveContext.tokens / contextWindow) * 100
+					: contextUsage?.percent;
 				const contextLabel = buildContextDisplayLabel({
-					percent: contextUsage?.percent,
+					percent: contextPercent,
 					contextWindow,
 					style: config.contextStyle,
 					asciiGauge: iconMode === "ascii",
 				});
-				const tier = contextColorTier(contextUsage?.percent, config.contextThresholds);
+				const tier = contextColorTier(contextPercent, config.contextThresholds);
 				const contextColor =
 					tier === "error"
 						? config.colors.contextError
@@ -239,8 +277,14 @@ export function installFooter(
 					switch (canonical) {
 						case "cwd":
 							return cwdLabel;
+						case "session_name":
+							return sessionNameLabel;
 						case "git_branch":
-							return branch ? (gitIcon ? `${gitIcon} ${gitColor(branch)}` : gitColor(branch)) : "";
+							return branchText
+								? gitIcon
+									? `${gitIcon} ${gitColor(branchText)}`
+									: gitColor(branchText)
+								: "";
 						case "git_status":
 							return statusBlock;
 						case "git_state":
@@ -366,8 +410,8 @@ export function installFooter(
 				};
 				const branchParts: string[] = [];
 				if (config.footerSegments.gitBranch) {
-					if (branch) {
-						branchParts.push("on", gitIcon, gitColor(branch));
+					if (branchText) {
+						branchParts.push("on", gitIcon, gitColor(branchText));
 					} else if (state.commit?.detached) {
 						// `HEAD` uses git-branch style; `(hash)` uses git-commit style
 						// (bold green) per Starship `git_commit` format.
@@ -463,6 +507,7 @@ export function installFooter(
 					osSegment,
 					usernameSegment,
 					config.footerSegments.cwd ? cwdLabel : "",
+					config.footerSegments.sessionName ? builtInSessionNameLabel : "",
 					branchLabel,
 					gitCommitLabel,
 					gitMetricsLabel,

@@ -12,11 +12,17 @@ import {
 	defaultConfig,
 	type ExtensionStatusPlacement,
 	type PolishedTuiConfig,
+	type SeparatorStyle,
 } from "../extensions/zentui/config";
 import { installFooter } from "../extensions/zentui/footer";
 import { emptyGitStatus } from "../extensions/zentui/git";
 import zentui from "../extensions/zentui/index";
-import { patchSelectorBorderStyle } from "../extensions/zentui/selector-border";
+import { ZENTUI_PROTOTYPE_PATCH_REGISTRY } from "../extensions/zentui/prototype-patch-registry";
+import {
+	installSelectorBorderStyle,
+	patchSelectorBorderStyle,
+} from "../extensions/zentui/selector-border";
+import { SessionLifecycle } from "../extensions/zentui/session-lifecycle";
 import { registerZentuiSettingsCommand } from "../extensions/zentui/settings-command";
 import { createInitialState } from "../extensions/zentui/state";
 import { PolishedEditor, WrappedPolishedEditor } from "../extensions/zentui/ui";
@@ -32,6 +38,7 @@ const originalUserMessageRender = UserMessageComponent.prototype.render;
 const originalUserMessageInvalidate = UserMessageComponent.prototype.invalidate;
 const originalModelSelectorRender = ModelSelectorComponent.prototype.render;
 const originalSettingsSelectorRender = SettingsSelectorComponent.prototype.render;
+const inactiveSessionLifecycle = new SessionLifecycle();
 
 function makeTheme(): Theme {
 	return {
@@ -206,11 +213,6 @@ function stripTestTags(line: string): string {
 	return stripPromptMarks(line).replaceAll(/\[[^\]]+\]/g, "");
 }
 
-function setOriginalUserMessageRenderStub(prefix = "original") {
-	const prototype = UserMessageComponent.prototype as unknown as Record<string, unknown>;
-	prototype.__zentuiUserMessageOriginalRender = (width: number) => [`${prefix}:${width}`];
-}
-
 function loadExtension(options: { thinkingLevel?: string; commands?: Map<string, unknown> } = {}) {
 	const handlers = new Map<string, Handler[]>();
 	zentui({
@@ -252,7 +254,7 @@ function makeContext(overrides: Record<string, unknown> = {}) {
 		mode: "tui",
 		cwd: process.cwd(),
 		model: { id: "claude-sonnet", provider: "anthropic", contextWindow: 200_000 },
-		sessionManager: { getBranch: () => [] },
+		sessionManager: { getBranch: () => [], getSessionName: () => undefined },
 		getContextUsage: () => ({ tokens: 1000, contextWindow: 200_000, percent: 0.5 }),
 		ui: overrideUi ? { ...ui, ...overrideUi } : ui,
 		...overrides,
@@ -263,16 +265,9 @@ function makeContext(overrides: Record<string, unknown> = {}) {
 afterEach(() => {
 	UserMessageComponent.prototype.render = originalUserMessageRender;
 	UserMessageComponent.prototype.invalidate = originalUserMessageInvalidate;
-	const prototype = UserMessageComponent.prototype as unknown as Record<string, unknown>;
-	prototype.__zentuiUserMessageOriginalRender = undefined;
-	prototype.__zentuiUserMessageOriginalInvalidate = undefined;
-	prototype.__zentuiUserMessagePatched = undefined;
-	prototype.__zentuiUserMessageInvalidatePatched = undefined;
-	prototype.__zentuiUserMessageWrapper = undefined;
-	prototype.__zentuiUserMessageInvalidateWrapper = undefined;
-	prototype.__zentuiUserMessageActive = undefined;
-	prototype.__zentuiUserMessageGetTheme = undefined;
-	prototype.__zentuiUserMessageGetConfig = undefined;
+	delete (UserMessageComponent.prototype as unknown as Record<PropertyKey, unknown>)[
+		ZENTUI_PROTOTYPE_PATCH_REGISTRY
+	];
 
 	ModelSelectorComponent.prototype.render = originalModelSelectorRender;
 	SettingsSelectorComponent.prototype.render = originalSettingsSelectorRender;
@@ -280,13 +275,9 @@ afterEach(() => {
 		ModelSelectorComponent.prototype,
 		SettingsSelectorComponent.prototype,
 	]) {
-		const patchable = selectorPrototype as unknown as Record<string, unknown>;
-		patchable.__zentuiSelectorBorderOriginalRender = undefined;
-		patchable.__zentuiSelectorBorderPatched = undefined;
-		patchable.__zentuiSelectorBorderWrapper = undefined;
-		patchable.__zentuiSelectorBorderActive = undefined;
-		patchable.__zentuiSelectorBorderGetTheme = undefined;
-		patchable.__zentuiSelectorBorderGetConfig = undefined;
+		delete (selectorPrototype as unknown as Record<PropertyKey, unknown>)[
+			ZENTUI_PROTOTYPE_PATCH_REGISTRY
+		];
 	}
 });
 
@@ -427,11 +418,13 @@ describe("Pi docs compliance", () => {
 			setText() {},
 		});
 		let editorFactory: unknown = existingEditorFactory;
+		let setEditorCalls = 0;
 		const ctx = makeContext({
 			ui: {
 				theme: makeTheme(),
 				setFooter() {},
 				setEditorComponent(factory: unknown) {
+					setEditorCalls += 1;
 					editorFactory = factory;
 				},
 				getEditorComponent() {
@@ -444,8 +437,50 @@ describe("Pi docs compliance", () => {
 		expect(editorFactory).not.toBe(existingEditorFactory);
 
 		await emit(handlers, "session_shutdown", ctx);
+		await emit(handlers, "session_shutdown", ctx);
 
 		expect(editorFactory).toBe(existingEditorFactory);
+		expect(setEditorCalls).toBe(2);
+	});
+
+	it("cleans up when start and shutdown use distinct context wrappers", async () => {
+		const handlers = loadExtension();
+		const runner = {
+			editorFactory: undefined as unknown,
+			setEditorCalls: 0,
+			footerClears: 0,
+		};
+		let startContextStale = false;
+		const makeUiWrapper = (isStale: () => boolean) => ({
+			theme: makeTheme(),
+			setFooter(factory: unknown) {
+				if (isStale()) throw new Error("stale start ctx setFooter");
+				if (factory === undefined) runner.footerClears += 1;
+			},
+			setEditorComponent(factory: unknown) {
+				if (isStale()) throw new Error("stale start ctx setEditorComponent");
+				runner.setEditorCalls += 1;
+				runner.editorFactory = factory;
+			},
+			getEditorComponent() {
+				if (isStale()) throw new Error("stale start ctx getEditorComponent");
+				return runner.editorFactory;
+			},
+		});
+		const startCtx = makeContext({ ui: makeUiWrapper(() => startContextStale) });
+		const shutdownCtx = makeContext({ ui: makeUiWrapper(() => false) });
+		expect(shutdownCtx).not.toBe(startCtx);
+		expect(shutdownCtx.ui).not.toBe(startCtx.ui);
+
+		await emit(handlers, "session_start", startCtx);
+		expect(runner.editorFactory).toBeTypeOf("function");
+		startContextStale = true;
+		await expect(emit(handlers, "session_shutdown", shutdownCtx)).resolves.toBeUndefined();
+		await emit(handlers, "session_shutdown", shutdownCtx);
+
+		expect(runner.editorFactory).toBeUndefined();
+		expect(runner.setEditorCalls).toBe(2);
+		expect(runner.footerClears).toBe(1);
 	});
 
 	it("refreshes a stale Zentui editor factory on extension reload instead of adopting old closures", async () => {
@@ -547,14 +582,17 @@ describe("Pi docs compliance", () => {
 		});
 
 		await emit(handlers, "session_start", ctx);
-		installUserMessageStyle(
+		const predecessor = (width: number) => [`original:${width}`];
+		UserMessageComponent.prototype.render = predecessor;
+		const cleanup = installUserMessageStyle(
 			() => makeTaggedTheme(),
 			() => configWithFeatures({ userMessages: false }),
 		);
-		setOriginalUserMessageRenderStub();
 
 		expect(editorFactory).toBeTypeOf("function");
 		expect(new UserMessageComponent("hello").render(80)).toEqual(["original:80"]);
+		cleanup();
+		expect(UserMessageComponent.prototype.render).toBe(predecessor);
 	});
 
 	it("re-wraps an editor component that loads after Zentui", async () => {
@@ -597,6 +635,48 @@ describe("Pi docs compliance", () => {
 		);
 		expect(editor.render(80).join("\n")).toContain("late vim editor");
 		expect(editor.render(80).join("\n")).toContain("NORMAL");
+	});
+
+	it("does not reconcile an editor after its session shuts down", async () => {
+		vi.useFakeTimers();
+		try {
+			const handlers = loadExtension();
+			const laterEditorFactory = () => ({
+				render: () => ["later"],
+				invalidate() {},
+				handleInput() {},
+				getText: () => "",
+				setText() {},
+			});
+			let editorFactory: unknown;
+			let stale = false;
+			const ctx = makeContext({
+				ui: {
+					theme: makeTheme(),
+					setFooter() {
+						if (stale) throw new Error("stale setFooter");
+					},
+					setEditorComponent(factory: unknown) {
+						if (stale) throw new Error("stale setEditorComponent");
+						editorFactory = factory;
+					},
+					getEditorComponent() {
+						if (stale) throw new Error("stale getEditorComponent");
+						return editorFactory;
+					},
+				},
+			});
+
+			await emit(handlers, "session_start", ctx);
+			editorFactory = laterEditorFactory;
+			await emit(handlers, "session_shutdown", ctx);
+			stale = true;
+
+			expect(() => vi.runAllTimers()).not.toThrow();
+			expect(editorFactory).toBe(laterEditorFactory);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("renders user messages like the ZentUI prompt box", () => {
@@ -767,13 +847,13 @@ describe("Pi docs compliance", () => {
 		expect(prototype.render(8)).toEqual(["Selector title", "────────", "help text"]);
 	});
 
-	it("selector cleanup disables patched border styling", () => {
+	it("selector cleanup restores its exact predecessor and is idempotent", () => {
 		const prototype = {
 			render(width: number) {
 				return ["─".repeat(width), "body", "─".repeat(width)];
 			},
 		};
-
+		const predecessor = prototype.render;
 		const cleanup = patchSelectorBorderStyle(
 			prototype,
 			() => makeTaggedTheme(),
@@ -782,7 +862,99 @@ describe("Pi docs compliance", () => {
 
 		expect(prototype.render(8)[0]).toContain("[borderMuted]────────");
 		cleanup();
-		expect(prototype.render(8)).toEqual(["────────", "body", "────────"]);
+		cleanup();
+		expect(prototype.render).toBe(predecessor);
+	});
+
+	it("does not stack selector wrappers and ignores stale cleanup", () => {
+		const predecessor = vi.fn((width: number) => ["─".repeat(width), "body", "─".repeat(width)]);
+		const prototype = { render: predecessor };
+		const firstCleanup = patchSelectorBorderStyle(
+			prototype,
+			() => makeTaggedTheme("first:"),
+			() => defaultConfig,
+		);
+		const wrapper = prototype.render;
+		const secondCleanup = patchSelectorBorderStyle(
+			prototype,
+			() => makeTaggedTheme("second:"),
+			() => defaultConfig,
+		);
+
+		expect(prototype.render).toBe(wrapper);
+		firstCleanup();
+		const rendered = prototype.render(8);
+		expect(rendered[0]).toContain("[second:borderMuted]────────");
+		expect(rendered[0]).not.toContain("first:");
+		expect(predecessor).toHaveBeenCalledTimes(1);
+		secondCleanup();
+		expect(prototype.render).toBe(predecessor);
+	});
+
+	it("preserves a later selector replacement and its predecessor chain", () => {
+		const predecessor = (width: number) => ["─".repeat(width), "body", "─".repeat(width)];
+		const prototype = { render: predecessor };
+		const getTheme = vi.fn(() => makeTaggedTheme());
+		const cleanup = patchSelectorBorderStyle(prototype, getTheme, () => defaultConfig);
+		const zentuiWrapper = prototype.render;
+		const thirdParty = function thirdParty(this: unknown, width: number): string[] {
+			return ["third-party", ...zentuiWrapper.call(this, width)];
+		};
+		prototype.render = thirdParty;
+
+		cleanup();
+		getTheme.mockClear();
+
+		expect(prototype.render).toBe(thirdParty);
+		expect(prototype.render(4)).toEqual(["third-party", "────", "body", "────"]);
+		expect(getTheme).not.toHaveBeenCalled();
+	});
+
+	it("deactivates an older selector record hidden inside a third-party predecessor chain", () => {
+		const predecessor = (width: number) => ["─".repeat(width), "body", "─".repeat(width)];
+		const prototype = { render: predecessor };
+		const firstTheme = vi.fn(() => makeTaggedTheme("first:"));
+		const secondTheme = vi.fn(() => makeTaggedTheme("second:"));
+		const cleanupFirst = patchSelectorBorderStyle(prototype, firstTheme, () => defaultConfig);
+		const firstWrapper = prototype.render;
+		const thirdParty = function thirdParty(this: unknown, width: number): string[] {
+			return ["third-party", ...firstWrapper.call(this, width)];
+		};
+		prototype.render = thirdParty;
+		const cleanupSecond = patchSelectorBorderStyle(prototype, secondTheme, () => defaultConfig);
+
+		cleanupFirst();
+		cleanupSecond();
+		firstTheme.mockClear();
+		secondTheme.mockClear();
+
+		expect(prototype.render).toBe(thirdParty);
+		expect(prototype.render(4)).toEqual(["third-party", "────", "body", "────"]);
+		expect(firstTheme).not.toHaveBeenCalled();
+		expect(secondTheme).not.toHaveBeenCalled();
+	});
+
+	it("restores model and settings selector prototypes independently", () => {
+		const modelPredecessor = ModelSelectorComponent.prototype.render;
+		const settingsPredecessor = SettingsSelectorComponent.prototype.render;
+		const cleanup = installSelectorBorderStyle(
+			() => makeTaggedTheme(),
+			() => defaultConfig,
+		);
+		const modelZentuiWrapper = ModelSelectorComponent.prototype.render;
+		const thirdPartyModelRender = function thirdPartyModelRender(
+			this: unknown,
+			width: number,
+		): string[] {
+			return modelZentuiWrapper.call(this as never, width);
+		};
+		ModelSelectorComponent.prototype.render = thirdPartyModelRender;
+
+		cleanup();
+
+		expect(ModelSelectorComponent.prototype.render).toBe(thirdPartyModelRender);
+		expect(SettingsSelectorComponent.prototype.render).toBe(settingsPredecessor);
+		expect(ModelSelectorComponent.prototype.render).not.toBe(modelPredecessor);
 	});
 
 	it("renders user-message borders from the user-message color source", () => {
@@ -801,38 +973,50 @@ describe("Pi docs compliance", () => {
 		expect(terminalRendered).toContain("\u001b[90m────");
 	});
 
-	it("user-message cleanup disables patched rendering", () => {
+	it("user-message cleanup restores exact render and invalidate predecessors", () => {
+		const predecessorRender = UserMessageComponent.prototype.render;
+		const predecessorInvalidate = UserMessageComponent.prototype.invalidate;
 		const cleanup = installUserMessageStyle(
 			() => makeTaggedTheme(),
 			() => defaultConfig,
 		);
 
+		expect(UserMessageComponent.prototype.render).not.toBe(predecessorRender);
+		expect(UserMessageComponent.prototype.invalidate).not.toBe(predecessorInvalidate);
 		expect(new UserMessageComponent("hello").render(80).join("\n")).toContain("[borderMuted]────");
-		setOriginalUserMessageRenderStub();
 		cleanup();
-		expect(new UserMessageComponent("hello").render(80)).toEqual(["original:80"]);
+		cleanup();
+
+		expect(UserMessageComponent.prototype.render).toBe(predecessorRender);
+		expect(UserMessageComponent.prototype.invalidate).toBe(predecessorInvalidate);
 	});
 
 	it("can disable previous user-message chrome while keeping the patch installed", () => {
-		installUserMessageStyle(
+		const predecessor = (width: number) => [`original:${width}`];
+		UserMessageComponent.prototype.render = predecessor;
+		const cleanup = installUserMessageStyle(
 			() => makeTaggedTheme(),
 			() => configWithFeatures({ userMessages: false }),
 		);
-		setOriginalUserMessageRenderStub();
 
 		expect(new UserMessageComponent("hello").render(80)).toEqual(["original:80"]);
+		cleanup();
+		expect(UserMessageComponent.prototype.render).toBe(predecessor);
 	});
 
-	it("falls back to the original user-message render when text cannot be found", () => {
-		installUserMessageStyle(
+	it("falls back to the predecessor user-message render when text cannot be found", () => {
+		const predecessor = (width: number) => [`fallback:${width}`];
+		UserMessageComponent.prototype.render = predecessor;
+		const cleanup = installUserMessageStyle(
 			() => makeTaggedTheme(),
 			() => defaultConfig,
 		);
-		setOriginalUserMessageRenderStub("fallback");
 
 		const lines = UserMessageComponent.prototype.render.call({ children: [] }, 42);
 
 		expect(lines).toEqual(["fallback:42"]);
+		cleanup();
+		expect(UserMessageComponent.prototype.render).toBe(predecessor);
 	});
 
 	it("preserves OSC 133 prompt-zone markers around user-message output", async () => {
@@ -863,21 +1047,89 @@ describe("Pi docs compliance", () => {
 		expect(lines.every((line) => visibleWidth(line) <= 12)).toBe(true);
 	});
 
-	it("refreshes user-message render state after extension reload", () => {
-		installUserMessageStyle(
+	it("reuses user-message wrappers while stale cleanup leaves the new registration active", () => {
+		const predecessorRender = UserMessageComponent.prototype.render;
+		const predecessorInvalidate = UserMessageComponent.prototype.invalidate;
+		const firstCleanup = installUserMessageStyle(
 			() => makeTaggedTheme("first:"),
 			() => defaultConfig,
 		);
+		const renderWrapper = UserMessageComponent.prototype.render;
+		const invalidateWrapper = UserMessageComponent.prototype.invalidate;
 		const firstRender = new UserMessageComponent("hello").render(80).join("\n");
 		expect(firstRender).toMatch(/\[first:accent\]│|\u001b\[34m│\u001b\[0m/);
 
-		installUserMessageStyle(
+		const secondCleanup = installUserMessageStyle(
 			() => makeTaggedTheme("second:"),
 			() => defaultConfig,
 		);
+		expect(UserMessageComponent.prototype.render).toBe(renderWrapper);
+		expect(UserMessageComponent.prototype.invalidate).toBe(invalidateWrapper);
+		firstCleanup();
 		const secondRender = new UserMessageComponent("hello").render(80).join("\n");
 		expect(secondRender).not.toContain("[first:accent]│");
 		expect(secondRender).toMatch(/\[second:accent\]│|\u001b\[34m│\u001b\[0m/);
+
+		secondCleanup();
+		expect(UserMessageComponent.prototype.render).toBe(predecessorRender);
+		expect(UserMessageComponent.prototype.invalidate).toBe(predecessorInvalidate);
+	});
+
+	it("deactivates an older user-message record hidden inside a third-party predecessor chain", () => {
+		const prototype = UserMessageComponent.prototype;
+		const predecessorRender = (width: number) => [`base:${width}`];
+		const predecessorInvalidate = vi.fn();
+		prototype.render = predecessorRender;
+		prototype.invalidate = predecessorInvalidate;
+		const firstTheme = vi.fn(() => makeTaggedTheme("first:"));
+		const secondTheme = vi.fn(() => makeTaggedTheme("second:"));
+		const cleanupFirst = installUserMessageStyle(firstTheme, () => defaultConfig);
+		const firstWrapper = prototype.render;
+		const thirdParty = function thirdParty(this: unknown, width: number): string[] {
+			return ["third-party", ...firstWrapper.call(this as never, width)];
+		};
+		prototype.render = thirdParty;
+		const cleanupSecond = installUserMessageStyle(secondTheme, () => defaultConfig);
+
+		cleanupFirst();
+		cleanupSecond();
+		firstTheme.mockClear();
+		secondTheme.mockClear();
+
+		expect(prototype.render).toBe(thirdParty);
+		expect(prototype.invalidate).toBe(predecessorInvalidate);
+		expect(prototype.render.call({ children: [{ text: "hello" }] } as never, 12)).toEqual([
+			"third-party",
+			"base:12",
+		]);
+		expect(firstTheme).not.toHaveBeenCalled();
+		expect(secondTheme).not.toHaveBeenCalled();
+	});
+
+	it("keeps a later user-message replacement and releases old theme closures", () => {
+		const prototype = UserMessageComponent.prototype;
+		const predecessorRender = (width: number) => [`base:${width}`];
+		const predecessorInvalidate = vi.fn();
+		prototype.render = predecessorRender;
+		prototype.invalidate = predecessorInvalidate;
+		const getTheme = vi.fn(() => makeTaggedTheme("old:"));
+		const cleanup = installUserMessageStyle(getTheme, () => defaultConfig);
+		const zentuiWrapper = prototype.render;
+		const thirdParty = function thirdParty(this: unknown, width: number): string[] {
+			return ["third-party", ...zentuiWrapper.call(this as never, width)];
+		};
+		prototype.render = thirdParty;
+
+		cleanup();
+		getTheme.mockClear();
+
+		expect(prototype.render).toBe(thirdParty);
+		expect(prototype.invalidate).toBe(predecessorInvalidate);
+		expect(prototype.render.call({ children: [{ text: "hello" }] } as never, 12)).toEqual([
+			"third-party",
+			"base:12",
+		]);
+		expect(getTheme).not.toHaveBeenCalled();
 	});
 
 	it("keeps custom footer output within the requested render width", async () => {
@@ -975,6 +1227,81 @@ describe("Pi docs compliance", () => {
 		expect(rendered).toContain("$0.001");
 	});
 
+	it.each([
+		["pipe", " | "],
+		["dot", " · "],
+		["chevron", " › "],
+		["none", " "],
+	] as Array<[SeparatorStyle, string]>)(
+		"renders %s separators between extension statuses and built-in right segments",
+		(separator, expectedSeparator) => {
+			let footerFactory: FooterFactory | undefined;
+			const ctx = makeContext({
+				cwd: "/tmp/project",
+				ui: {
+					theme: makeTheme(),
+					setFooter(factory: FooterFactory | undefined) {
+						footerFactory = factory;
+					},
+					setEditorComponent() {},
+				},
+			});
+			const state = createInitialState(emptyGitStatus());
+			state.tokenLabel = "tokens";
+			state.costLabel = "cost";
+			const config = { ...defaultConfig, separator };
+
+			installFooter(ctx as never, state, () => config, {
+				setRequestRender() {},
+				scheduleProjectRefresh() {},
+			});
+
+			const footer = footerFactory?.({ requestRender() {} }, makeTheme(), {
+				onBranchChange: () => () => {},
+				getExtensionStatuses: () =>
+					new Map<string, string>([
+						["beta", "B"],
+						["alpha", "A"],
+					]),
+			});
+			const rendered = footer?.render(160).join("\n") ?? "";
+
+			expect(rendered).toContain(["A", "B", "1%/200k", "tokens", "cost"].join(expectedSeparator));
+		},
+	);
+
+	it("keeps custom footer format $sep as a pipe", () => {
+		let footerFactory: FooterFactory | undefined;
+		const ctx = makeContext({
+			cwd: "/tmp/project",
+			ui: {
+				theme: makeTheme(),
+				setFooter(factory: FooterFactory | undefined) {
+					footerFactory = factory;
+				},
+				setEditorComponent() {},
+			},
+		});
+		const state = createInitialState(emptyGitStatus());
+		state.tokenLabel = "tokens";
+		const config = {
+			...defaultConfig,
+			separator: "dot" as const,
+			footerFormat: "$cwd$fill$context$sep$tokens",
+		};
+
+		installFooter(ctx as never, state, () => config, {
+			setRequestRender() {},
+			scheduleProjectRefresh() {},
+		});
+		const footer = footerFactory?.({ requestRender() {} }, makeTheme(), {
+			onBranchChange: () => () => {},
+			getExtensionStatuses: () => new Map<string, string>(),
+		});
+
+		expect(footer?.render(120).join("\n") ?? "").toContain("1%/200k | tokens");
+	});
+
 	it("honors third-party status placements and hides off statuses", () => {
 		let footerFactory: FooterFactory | undefined;
 		const ctx = makeContext({
@@ -991,14 +1318,19 @@ describe("Pi docs compliance", () => {
 		state.contextLabel = "1%/200k";
 		state.tokenLabel = "↑1 ↓2";
 		state.costLabel = "$0.001";
-		const config = configWithExtensionStatuses({
-			placements: {
-				alpha: "left",
-				beta: "middle",
-				gamma: "right",
-				hidden: "off",
-			},
-		});
+		const config = {
+			...configWithExtensionStatuses({
+				placements: {
+					alpha: "left",
+					alpha2: "left",
+					beta: "middle",
+					beta2: "middle",
+					gamma: "right",
+					hidden: "off",
+				},
+			}),
+			separator: "chevron" as const,
+		};
 
 		installFooter(ctx as never, state, () => config, {
 			setRequestRender() {},
@@ -1010,16 +1342,17 @@ describe("Pi docs compliance", () => {
 			getExtensionStatuses: () =>
 				new Map<string, string>([
 					["alpha", "left-status"],
+					["alpha2", "left-status-2"],
 					["beta", "middle-status"],
+					["beta2", "middle-status-2"],
 					["gamma", "right-status"],
 					["hidden", "hidden-status"],
 				]),
 		});
 		const rendered = footer?.render(180).join("\n") ?? "";
 
-		expect(rendered).toContain("left-status");
-		expect(rendered).toContain(" | left-status");
-		expect(rendered).toContain("middle-status");
+		expect(rendered).toContain(" › left-status › left-status-2");
+		expect(rendered).toContain("middle-status › middle-status-2");
 		expect(rendered).toContain("right-status");
 		expect(rendered).not.toContain("hidden-status");
 	});
@@ -1123,6 +1456,42 @@ describe("Pi docs compliance", () => {
 		expect(line).toContain("↑1 ↓2");
 		expect(line).toContain("$0.001");
 		expect(visibleWidth(line)).toBeLessThanOrEqual(44);
+	});
+
+	it("truncates built-in and template branch aliases with the shared branch length", () => {
+		let footerFactory: FooterFactory | undefined;
+		const ctx = makeContext({
+			cwd: "/tmp/project",
+			ui: {
+				theme: makeTheme(),
+				setFooter(factory: FooterFactory | undefined) {
+					footerFactory = factory;
+				},
+				setEditorComponent() {},
+			},
+		});
+		const state = createInitialState(emptyGitStatus());
+		state.branch = "feature/very-long";
+		const baseConfig: PolishedTuiConfig = {
+			...defaultConfig,
+			gitBranch: { maxLength: 6 },
+			icons: { ...defaultConfig.icons, git: "" },
+		};
+		const render = (footerFormat: string) => {
+			installFooter(ctx as never, state, () => ({ ...baseConfig, footerFormat }), {
+				setRequestRender() {},
+				scheduleProjectRefresh() {},
+			});
+			const footer = footerFactory?.({ requestRender() {} }, makeTheme(), {
+				onBranchChange: () => () => {},
+				getExtensionStatuses: () => new Map<string, string>(),
+			});
+			return footer?.render(160).join("\n") ?? "";
+		};
+
+		expect(render("")).toContain("on featu…");
+		expect(render("$git_branch|$branch")).toContain("featu…|featu…");
+		expect(render("$git_branch|$branch")).not.toContain("feature/very-long");
 	});
 
 	it("does not leave an extra branch gap when the git icon is empty", () => {
@@ -1288,6 +1657,7 @@ describe("Pi docs compliance", () => {
 			const config: PolishedTuiConfig = {
 				...defaultConfig,
 				footerSegments: { ...defaultConfig.footerSegments, gitCommit: true },
+				gitBranch: { maxLength: 1 },
 				gitCommit: { hashLength: 7, onlyDetached, showTag: true },
 			};
 			installFooter(ctx as never, state, () => config, {
@@ -1766,6 +2136,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures: () => ({ applied: true }),
@@ -1774,6 +2145,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -1809,6 +2182,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures: () => ({ applied: true }),
@@ -1817,6 +2191,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -1852,6 +2228,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures(patch) {
@@ -1863,6 +2240,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -1899,6 +2278,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures(patch) {
@@ -1909,10 +2289,13 @@ describe("Pi docs compliance", () => {
 				setFooterFormat() {},
 				setIconMode() {},
 				setContextStyle() {},
+				setSeparator() {},
 				setPathDisplay() {},
+				setGitBranch() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
+				setFixedEditor() {},
 				requestRender() {},
 			},
 		);
@@ -1941,6 +2324,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures(patch) {
@@ -1952,6 +2336,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -1977,6 +2363,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures(patch) {
@@ -1988,6 +2375,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -2020,6 +2409,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures: () => ({
@@ -2032,6 +2422,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -2064,6 +2456,8 @@ describe("Pi docs compliance", () => {
 			let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
 			let doneCalls = 0;
 			const doneCallsAtFeatureChange: number[] = [];
+			const sessionLifecycle = new SessionLifecycle();
+			sessionLifecycle.start();
 
 			registerZentuiSettingsCommand(
 				{
@@ -2072,6 +2466,7 @@ describe("Pi docs compliance", () => {
 					},
 				} as never,
 				{
+					sessionLifecycle,
 					getConfig: () => defaultConfig,
 					setColorSources() {},
 					setUiFeatures() {
@@ -2083,6 +2478,8 @@ describe("Pi docs compliance", () => {
 					setIconMode() {},
 					setContextStyle() {},
 					setPathDisplay() {},
+					setGitBranch() {},
+					setSeparator() {},
 					getActiveExtensionStatuses: () => new Map<string, string>(),
 					setExtensionStatusPlacement() {},
 					setExtensionStatusColorMode() {},
@@ -2125,6 +2522,147 @@ describe("Pi docs compliance", () => {
 		}
 	});
 
+	it("does not update a settings value when persistence fails", async () => {
+		let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+		const attemptedPatches: Partial<PolishedTuiConfig["features"]>[] = [];
+		const notifications: string[] = [];
+		registerZentuiSettingsCommand(
+			{
+				registerCommand(_name: string, options: unknown) {
+					command = options as typeof command;
+				},
+			} as never,
+			{
+				sessionLifecycle: inactiveSessionLifecycle,
+				getConfig: () => defaultConfig,
+				setColorSources() {},
+				setUiFeatures(patch) {
+					attemptedPatches.push(patch);
+					throw new Error("config is corrupt");
+				},
+				setFooterSegments() {},
+				setFooterFormat() {},
+				setIconMode() {},
+				setContextStyle() {},
+				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
+				getActiveExtensionStatuses: () => new Map<string, string>(),
+				setExtensionStatusPlacement() {},
+				setExtensionStatusColorMode() {},
+				setFixedEditor() {},
+				requestRender() {},
+				settingsListTheme: {
+					label: (text) => text,
+					value: (text) => text,
+					description: (text) => text,
+					cursor: "> ",
+					hint: (text) => text,
+				},
+			},
+		);
+
+		await command?.handler("", {
+			hasUI: true,
+			mode: "tui",
+			ui: {
+				theme: makeTaggedTheme(),
+				notify(message: string) {
+					notifications.push(message);
+				},
+				async custom(factory: (...args: unknown[]) => unknown) {
+					const component = factory({ requestRender() {} }, makeTaggedTheme(), {}, () => {}) as {
+						handleInput?: (data: string) => void;
+					};
+					component.handleInput?.("\t");
+					component.handleInput?.("\x1b[B");
+					component.handleInput?.("\x1b[B");
+					component.handleInput?.(" ");
+					component.handleInput?.("\x1b[B");
+					component.handleInput?.(" ");
+				},
+			},
+		});
+
+		expect(attemptedPatches).toEqual([{ statusLine: false }, { userMessages: false }]);
+		expect(notifications).toEqual([
+			"Could not update Zentui settings: config is corrupt",
+			"Could not update Zentui settings: config is corrupt",
+		]);
+	});
+
+	it("drops a deferred settings editor swap after session shutdown", async () => {
+		vi.useFakeTimers();
+		try {
+			let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+			let featureChanges = 0;
+			let stale = false;
+			const sessionLifecycle = new SessionLifecycle();
+			sessionLifecycle.start();
+			registerZentuiSettingsCommand(
+				{
+					registerCommand(_name: string, options: unknown) {
+						command = options as typeof command;
+					},
+				} as never,
+				{
+					sessionLifecycle,
+					getConfig: () => defaultConfig,
+					setColorSources() {},
+					setUiFeatures() {
+						featureChanges += 1;
+						return { applied: true };
+					},
+					setFooterSegments() {},
+					setFooterFormat() {},
+					setIconMode() {},
+					setContextStyle() {},
+					setPathDisplay() {},
+					setGitBranch() {},
+					setSeparator() {},
+					getActiveExtensionStatuses: () => new Map<string, string>(),
+					setExtensionStatusPlacement() {},
+					setExtensionStatusColorMode() {},
+					setFixedEditor() {},
+					requestRender() {},
+					settingsListTheme: {
+						label: (text) => text,
+						value: (text) => text,
+						description: (text) => text,
+						cursor: "> ",
+						hint: (text) => text,
+					},
+				},
+			);
+			const ctx = {
+				hasUI: true,
+				mode: "tui",
+				ui: {
+					theme: makeTaggedTheme(),
+					notify() {
+						if (stale) throw new Error("stale notify");
+					},
+					async custom(factory: (...args: unknown[]) => unknown) {
+						const component = factory({ requestRender() {} }, makeTaggedTheme(), {}, () => {}) as {
+							handleInput?: (data: string) => void;
+						};
+						component.handleInput?.("\t");
+						component.handleInput?.(" ");
+					},
+				},
+			};
+
+			await command?.handler("", ctx);
+			sessionLifecycle.shutdown();
+			stale = true;
+
+			expect(() => vi.runAllTimers()).not.toThrow();
+			expect(featureChanges).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("renders Zentui settings with mode-aware top and bottom borders", async () => {
 		const settingsWidth = 160;
 		async function renderSettings(config: PolishedTuiConfig) {
@@ -2138,6 +2676,7 @@ describe("Pi docs compliance", () => {
 					},
 				} as never,
 				{
+					sessionLifecycle: inactiveSessionLifecycle,
 					getConfig: () => config,
 					setColorSources() {},
 					setUiFeatures: () => ({ applied: true }),
@@ -2146,6 +2685,8 @@ describe("Pi docs compliance", () => {
 					setIconMode() {},
 					setContextStyle() {},
 					setPathDisplay() {},
+					setGitBranch() {},
+					setSeparator() {},
 					getActiveExtensionStatuses: () => new Map<string, string>(),
 					setExtensionStatusPlacement() {},
 					setExtensionStatusColorMode() {},
@@ -2210,6 +2751,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures: () => ({ applied: true }),
@@ -2218,6 +2760,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -2251,6 +2795,153 @@ describe("Pi docs compliance", () => {
 		).resolves.toBeUndefined();
 	});
 
+	it("cycles the separator from the Zentui layout settings", async () => {
+		let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+		const changes: SeparatorStyle[] = [];
+		const notifications: string[] = [];
+		let dependencyRenderRequests = 0;
+		let tuiRenderRequests = 0;
+
+		registerZentuiSettingsCommand(
+			{
+				registerCommand(_name: string, options: unknown) {
+					command = options as typeof command;
+				},
+			} as never,
+			{
+				sessionLifecycle: inactiveSessionLifecycle,
+				getConfig: () => defaultConfig,
+				setColorSources() {},
+				setUiFeatures: () => ({ applied: true }),
+				setFooterSegments() {},
+				setFooterFormat() {},
+				setIconMode() {},
+				setContextStyle() {},
+				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator(separator) {
+					changes.push(separator);
+				},
+				getActiveExtensionStatuses: () => new Map<string, string>(),
+				setExtensionStatusPlacement() {},
+				setExtensionStatusColorMode() {},
+				setFixedEditor() {},
+				requestRender() {
+					dependencyRenderRequests += 1;
+				},
+				settingsListTheme: {
+					label: (text) => text,
+					value: (text) => text,
+					description: (text) => text,
+					cursor: "> ",
+					hint: (text) => text,
+				},
+			},
+		);
+
+		await command?.handler("", {
+			hasUI: true,
+			mode: "tui",
+			ui: {
+				theme: makeTheme(),
+				notify(message: string) {
+					notifications.push(message);
+				},
+				async custom(factory: (...args: unknown[]) => unknown) {
+					const component = factory(
+						{
+							requestRender() {
+								tuiRenderRequests += 1;
+							},
+						},
+						makeTheme(),
+						{},
+						() => {},
+					) as { handleInput?: (data: string) => void };
+					component.handleInput?.("\t");
+					component.handleInput?.("\t");
+					component.handleInput?.("\x1b[B");
+					component.handleInput?.(" ");
+					component.handleInput?.(" ");
+					component.handleInput?.(" ");
+					component.handleInput?.(" ");
+				},
+			},
+		});
+
+		expect(changes).toEqual(["dot", "chevron", "none", "pipe"]);
+		expect(notifications).toEqual([
+			"Separator: dot",
+			"Separator: chevron",
+			"Separator: none",
+			"Separator: pipe",
+		]);
+		expect(dependencyRenderRequests).toBe(4);
+		expect(tuiRenderRequests).toBe(6);
+	});
+
+	it("cycles branch length presets and returns custom JSON values to full", async () => {
+		const run = async (maxLength: PolishedTuiConfig["gitBranch"]["maxLength"], presses: number) => {
+			let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+			const changes: Array<PolishedTuiConfig["gitBranch"]["maxLength"]> = [];
+			registerZentuiSettingsCommand(
+				{
+					registerCommand(_name: string, options: unknown) {
+						command = options as typeof command;
+					},
+				} as never,
+				{
+					sessionLifecycle: inactiveSessionLifecycle,
+					getConfig: () => ({ ...defaultConfig, gitBranch: { maxLength } }),
+					setColorSources() {},
+					setUiFeatures: () => ({ applied: true }),
+					setFooterSegments() {},
+					setFooterFormat() {},
+					setIconMode() {},
+					setContextStyle() {},
+					setPathDisplay() {},
+					setGitBranch(patch) {
+						if (patch.maxLength !== undefined) changes.push(patch.maxLength);
+					},
+					setSeparator() {},
+					getActiveExtensionStatuses: () => new Map<string, string>(),
+					setExtensionStatusPlacement() {},
+					setExtensionStatusColorMode() {},
+					setFixedEditor() {},
+					requestRender() {},
+					settingsListTheme: {
+						label: (text) => text,
+						value: (text) => text,
+						description: (text) => text,
+						cursor: "> ",
+						hint: (text) => text,
+					},
+				},
+			);
+			await command?.handler("", {
+				hasUI: true,
+				mode: "tui",
+				ui: {
+					theme: makeTheme(),
+					notify() {},
+					async custom(factory: (...args: unknown[]) => unknown) {
+						const component = factory({ requestRender() {} }, makeTheme(), {}, () => {}) as {
+							handleInput?: (data: string) => void;
+						};
+						component.handleInput?.("\t");
+						component.handleInput?.("\t");
+						for (let index = 0; index < 4; index += 1) component.handleInput?.("\x1b[B");
+						for (let index = 0; index < presses; index += 1) component.handleInput?.(" ");
+					},
+				},
+			});
+			return changes;
+		};
+
+		expect(await run("full", 6)).toEqual([10, 20, 30, 40, 50, "full"]);
+		expect(await run(17, 1)).toEqual(["full"]);
+	});
+
 	it("keeps the Zentui settings command open after applying a change", async () => {
 		let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
 		const changes: Partial<PolishedTuiConfig["colorSources"]>[] = [];
@@ -2265,6 +2956,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources(patch) {
 					changes.push(patch);
@@ -2275,6 +2967,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -2335,6 +3029,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => configWithColorSources({ editor: "theme", userMessages: "terminal" }),
 				setColorSources(patch) {
 					changes.push(patch);
@@ -2345,6 +3040,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -2402,6 +3099,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures: () => ({ applied: true }),
@@ -2410,6 +3108,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -2458,6 +3158,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures: () => ({ applied: true }),
@@ -2466,6 +3167,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () =>
 					new Map<string, string>([
 						["alpha", "A"],
@@ -2519,6 +3222,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures: () => ({ applied: true }),
@@ -2527,6 +3231,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>(),
 				setExtensionStatusPlacement(key, placement) {
 					placements.push({ key, placement });
@@ -2580,6 +3286,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () => defaultConfig,
 				setColorSources() {},
 				setUiFeatures: () => ({ applied: true }),
@@ -2588,6 +3295,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>([["alpha", "ok"]]),
 				setExtensionStatusPlacement(key, placement) {
 					placements.push({ key, placement });
@@ -2646,6 +3355,7 @@ describe("Pi docs compliance", () => {
 				},
 			} as never,
 			{
+				sessionLifecycle: inactiveSessionLifecycle,
 				getConfig: () =>
 					configWithExtensionStatuses({
 						placements: { active: "middle", inactive: "left" },
@@ -2657,6 +3367,8 @@ describe("Pi docs compliance", () => {
 				setIconMode() {},
 				setContextStyle() {},
 				setPathDisplay() {},
+				setGitBranch() {},
+				setSeparator() {},
 				getActiveExtensionStatuses: () => new Map<string, string>([["active", "ok"]]),
 				setExtensionStatusPlacement() {},
 				setExtensionStatusColorMode() {},
@@ -2692,5 +3404,217 @@ describe("Pi docs compliance", () => {
 		expect(rendered).toContain("active");
 		expect(rendered).toContain("middle");
 		expect(rendered).not.toContain("inactive");
+	});
+	type SessionNameFooterOptions = {
+		name?: string;
+		getSessionName?: () => string | undefined;
+		theme?: Theme;
+		footerFormat?: string;
+		segmentEnabled?: boolean;
+		sessionNameColor?: string;
+		branch?: string;
+		branchEnabled?: boolean;
+	};
+
+	function createSessionNameFooter({
+		name,
+		getSessionName = () => name,
+		theme = makeTheme(),
+		footerFormat = "",
+		segmentEnabled = true,
+		sessionNameColor = "success",
+		branch,
+		branchEnabled = false,
+	}: SessionNameFooterOptions) {
+		let footerFactory: FooterFactory | undefined;
+		const ctx = makeContext({
+			cwd: "/tmp/project",
+			sessionManager: { getBranch: () => [], getSessionName },
+			ui: {
+				theme,
+				setFooter(factory: FooterFactory | undefined) {
+					footerFactory = factory;
+				},
+				setEditorComponent() {},
+			},
+		});
+		const config: PolishedTuiConfig = {
+			...defaultConfig,
+			footerFormat,
+			colors: { ...defaultConfig.colors, sessionName: sessionNameColor },
+			footerSegments: {
+				...defaultConfig.footerSegments,
+				cwd: true,
+				sessionName: segmentEnabled,
+				gitBranch: branchEnabled,
+				gitStatus: false,
+				runtime: false,
+				context: false,
+				tokens: false,
+				cost: false,
+			},
+		};
+		installFooter(ctx as never, createInitialState({ ...emptyGitStatus(), branch }), () => config, {
+			setRequestRender() {},
+			scheduleProjectRefresh() {},
+		});
+		return footerFactory?.({ requestRender() {} }, theme, {
+			onBranchChange: () => () => {},
+			getExtensionStatuses: () => new Map<string, string>(),
+		});
+	}
+
+	function renderSessionNameFooter({
+		width,
+		...options
+	}: SessionNameFooterOptions & { width: number }): string[] {
+		return createSessionNameFooter(options)?.render(width) ?? [];
+	}
+
+	it("renders the default session name as 'in <name>' between cwd and branch", () => {
+		const rendered = renderSessionNameFooter({
+			name: "release prep",
+			width: 500,
+			theme: makeTaggedTheme(),
+			branch: "feat/session-name-footer",
+			branchEnabled: true,
+		}).join("\n");
+		expect(rendered).toContain("project in [success]release prep on");
+		expect(rendered.indexOf("project")).toBeLessThan(rendered.indexOf("release prep"));
+		expect(rendered.indexOf("release prep")).toBeLessThan(
+			rendered.indexOf("feat/session-name-footer"),
+		);
+	});
+
+	it("omits absent names and keeps Unicode names within narrow footer widths", () => {
+		const absent = renderSessionNameFooter({
+			name: undefined,
+			width: 120,
+			theme: makeTaggedTheme(),
+		}).join("\n");
+		expect(absent).not.toContain("undefined");
+		expect(absent).not.toContain("[success]");
+		expect(absent).not.toContain(" in ");
+		const lines = renderSessionNameFooter({ name: "研究 🚀 ".repeat(20), width: 18 });
+		expect(lines.every((line) => visibleWidth(line) <= 18)).toBe(true);
+	});
+
+	it("sanitizes terminal controls while preserving ordinary Unicode session names", () => {
+		const rendered = renderSessionNameFooter({
+			name: "\x1b[31mrelease\x1b[0m\tprep\x07\x1b]0;owned\x07研究 🚀",
+			width: 120,
+			theme: makeTaggedTheme(),
+		}).join("\n");
+		expect(rendered).toContain("release prep研究 🚀");
+		expect(rendered).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+		expect(rendered).not.toContain("owned");
+
+		const controlsOnly = renderSessionNameFooter({
+			name: "\x1b[2J\x1b]0;owned\x07\t\x07",
+			width: 120,
+			theme: makeTaggedTheme(),
+		}).join("\n");
+		expect(controlsOnly).not.toContain("[success]");
+		expect(controlsOnly).not.toContain("owned");
+		expect(controlsOnly).not.toContain(" in ");
+	});
+
+	it("respects an explicit disabled setting and skips unused session-name lookups", () => {
+		const getSessionName = vi.fn(() => "hidden");
+		const disabled = renderSessionNameFooter({
+			getSessionName,
+			width: 120,
+			segmentEnabled: false,
+		}).join("\n");
+		expect(disabled).not.toContain("hidden");
+		expect(disabled).not.toContain(" in ");
+		expect(getSessionName).not.toHaveBeenCalled();
+
+		renderSessionNameFooter({
+			getSessionName,
+			width: 120,
+			footerFormat: "$cwd",
+			segmentEnabled: true,
+		});
+		expect(getSessionName).not.toHaveBeenCalled();
+
+		renderSessionNameFooter({
+			getSessionName,
+			width: 120,
+			footerFormat: "${" + "session_name}",
+			segmentEnabled: false,
+		});
+		expect(getSessionName).toHaveBeenCalledOnce();
+	});
+
+	it("renders raw session-name tokens in custom formats without the built-in prefix", () => {
+		const named = renderSessionNameFooter({
+			name: "release prep",
+			width: 120,
+			footerFormat: "$cwd($sep$session_name)",
+			segmentEnabled: false,
+		}).join("\n");
+		expect(named).toContain("release prep");
+		expect(named).not.toContain("in release prep");
+		const braced = renderSessionNameFooter({
+			name: "release prep",
+			width: 120,
+			footerFormat: "$cwd ${" + "session_name}",
+			segmentEnabled: false,
+		}).join("\n");
+		expect(braced).toContain("project release prep");
+		expect(braced).not.toContain("in release prep");
+		const unnamed = renderSessionNameFooter({
+			name: undefined,
+			width: 120,
+			footerFormat: "$cwd$sep$session_name",
+			segmentEnabled: false,
+		}).join("\n");
+		expect(unnamed).toContain("project");
+		expect(unnamed).not.toContain(" | ");
+	});
+
+	it("reads an updated session name on the next footer render", () => {
+		let sessionName = "draft";
+		const footer = createSessionNameFooter({ getSessionName: () => sessionName });
+		expect(footer?.render(120).join("\n")).toContain("draft");
+
+		sessionName = "release prep";
+		const renamed = footer?.render(120).join("\n") ?? "";
+		expect(renamed).toContain("release prep");
+		expect(renamed).not.toContain("draft");
+	});
+
+	it("requests one footer render on session_info_changed", async () => {
+		const handlers = loadExtension();
+		let footerFactory: FooterFactory | undefined;
+		let renderRequests = 0;
+		const ctx = makeContext({
+			ui: {
+				theme: makeTheme(),
+				setFooter(factory: FooterFactory | undefined) {
+					footerFactory = factory;
+				},
+				setEditorComponent() {},
+			},
+		});
+		await emit(handlers, "session_start", ctx);
+		footerFactory?.(
+			{
+				requestRender() {
+					renderRequests += 1;
+				},
+			},
+			makeTheme(),
+			{
+				onBranchChange: () => () => {},
+				getExtensionStatuses: () => new Map(),
+			},
+		);
+		const handler = handlers.get("session_info_changed")?.[0];
+		const before = renderRequests;
+		expect(handler?.({ type: "session_info_changed", name: "release prep" }, ctx)).toBeUndefined();
+		expect(renderRequests).toBe(before + 1);
+		await emit(handlers, "session_shutdown", ctx);
 	});
 });

@@ -17,18 +17,23 @@ import {
 	type ExtensionStatusPlacement,
 	type FixedEditorConfig,
 	type FooterSegmentsConfig,
+	type GitBranchConfig,
+	type GitBranchMaxLength,
 	getExtensionStatusColorMode,
 	getExtensionStatusPlacement,
 	type IconMode,
 	isExtensionStatusColorMode,
 	isExtensionStatusPlacement,
+	isSeparatorStyle,
 	type PathDisplayConfig,
 	type PathDisplayMode,
 	type PolishedTuiConfig,
+	type SeparatorStyle,
 	type UiFeaturesConfig,
 } from "./config";
 import { sanitizeExtensionStatusText } from "./extension-status";
 import { isIconMode } from "./icons";
+import type { SessionLifecycle } from "./session-lifecycle";
 import { EDITOR_BORDER_STYLE, renderChromeBorder, safeThemeFg } from "./style";
 
 const colorSourceValues: ColorSource[] = ["theme", "terminal"];
@@ -40,8 +45,10 @@ const extensionStatusPlacementValues: ExtensionStatusPlacement[] = [
 ];
 const extensionStatusColorModeValues: ExtensionStatusColorMode[] = ["zentui", "original"];
 const contextStyleValues: ContextStyle[] = ["text", "gauge", "text+gauge"];
+const separatorStyleValues: SeparatorStyle[] = ["pipe", "dot", "chevron", "none"];
 const pathDisplayModeValues: PathDisplayMode[] = ["basename", "full"];
 const pathDepthValues = ["0", "1", "2", "3", "4", "5"] as const;
+const branchLengthPresetValues = ["full", "10", "20", "30", "40", "50"] as const;
 const iconModeValues: IconMode[] = ["auto", "nerd", "ascii"];
 type FeatureState = "enabled" | "disabled";
 
@@ -57,7 +64,13 @@ type ColorSettingId = "starship" | "editorMessages";
 type FeatureSettingId = keyof UiFeaturesConfig;
 type FooterSegmentSettingId = keyof FooterSegmentsConfig;
 type SettingsSection = (typeof settingsSections)[number];
-type LayoutSettingId = "contextStyle" | "pathDisplay" | "pathDepth" | "iconMode";
+type LayoutSettingId =
+	| "contextStyle"
+	| "separator"
+	| "pathDisplay"
+	| "pathDepth"
+	| "branchLength"
+	| "iconMode";
 type FeatureCommandAction = "enable" | "disable" | "toggle";
 
 const featureStateValues: FeatureState[] = ["enabled", "disabled"];
@@ -78,6 +91,7 @@ const featureCommandActions: Array<[FeatureCommandAction, string[]]> = [
 const featureCommandActionWords = new Set(featureCommandActions.flatMap(([, words]) => words));
 
 type SettingsCommandDeps = {
+	sessionLifecycle: SessionLifecycle;
 	getConfig: () => PolishedTuiConfig;
 	setColorSources: (patch: Partial<ColorSourcesConfig>) => void;
 	setUiFeatures: (
@@ -88,7 +102,9 @@ type SettingsCommandDeps = {
 	setFooterFormat: (value: string) => void;
 	setIconMode: (mode: IconMode) => void;
 	setContextStyle: (style: ContextStyle) => void;
+	setSeparator: (separator: SeparatorStyle) => void;
 	setPathDisplay: (patch: Partial<PathDisplayConfig>) => void;
+	setGitBranch: (patch: Partial<GitBranchConfig>) => void;
 	getActiveExtensionStatuses: () => ReadonlyMap<string, string>;
 	setExtensionStatusPlacement: (key: string, placement: ExtensionStatusPlacement) => void;
 	setExtensionStatusColorMode: (key: string, colorMode: ExtensionStatusColorMode) => void;
@@ -126,6 +142,7 @@ const featureSettingDescriptions: Record<FeatureSettingId, string> = {
 
 const footerSegmentSettingLabels: Record<FooterSegmentSettingId, string> = {
 	cwd: "Current directory",
+	sessionName: "Session name",
 	gitBranch: "Git branch",
 	gitStatus: "Git status",
 	gitCounts: "Git counts",
@@ -144,6 +161,7 @@ const footerSegmentSettingLabels: Record<FooterSegmentSettingId, string> = {
 
 const footerSegmentSettingDescriptions: Record<FooterSegmentSettingId, string> = {
 	cwd: "Show or hide the current working directory segment on the left.",
+	sessionName: "Show or hide the current Pi session name on the left, after the current directory.",
 	gitBranch: "Show or hide the git branch name on the left.",
 	gitStatus: "Show or hide git status icons and ahead/behind markers.",
 	gitCounts:
@@ -217,6 +235,7 @@ function isFeatureSettingId(value: string): value is FeatureSettingId {
 function isFooterSegmentSettingId(value: string): value is FooterSegmentSettingId {
 	return (
 		value === "cwd" ||
+		value === "sessionName" ||
 		value === "gitBranch" ||
 		value === "gitStatus" ||
 		value === "gitCounts" ||
@@ -250,11 +269,26 @@ function isPathDepthValue(value: string): boolean {
 	return (pathDepthValues as readonly string[]).includes(value);
 }
 
+function parseGitBranchLengthValue(value: string): GitBranchMaxLength | undefined {
+	if (value === "full") return value;
+	const parsed = Number(value);
+	return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function branchLengthValues(maxLength: GitBranchMaxLength): string[] {
+	const current = String(maxLength);
+	return (branchLengthPresetValues as readonly string[]).includes(current)
+		? [...branchLengthPresetValues]
+		: [current, ...branchLengthPresetValues];
+}
+
 function isLayoutSettingId(value: string): value is LayoutSettingId {
 	return (
 		value === "contextStyle" ||
+		value === "separator" ||
 		value === "pathDisplay" ||
 		value === "pathDepth" ||
+		value === "branchLength" ||
 		value === "iconMode"
 	);
 }
@@ -463,6 +497,13 @@ function buildItems(
 				values: contextStyleValues,
 			},
 			{
+				id: "separator",
+				label: "Separator",
+				description: "Choose the separator between default footer segments.",
+				currentValue: config.separator,
+				values: separatorStyleValues,
+			},
+			{
 				id: "pathDisplay",
 				label: "Path display",
 				description: "Show cwd as basename or full path (home contracted to ~).",
@@ -476,6 +517,13 @@ function buildItems(
 					"In full mode, trailing directories to show (0 = all, max 5). Ignored for basename.",
 				currentValue: String(config.pathDisplay.depth),
 				values: [...pathDepthValues],
+			},
+			{
+				id: "branchLength",
+				label: "Branch length",
+				description: "Show the full branch name or truncate it to a preset visible width.",
+				currentValue: String(config.gitBranch.maxLength),
+				values: branchLengthValues(config.gitBranch.maxLength),
 			},
 			{
 				id: "iconMode",
@@ -675,24 +723,25 @@ export function registerZentuiSettingsCommand(pi: ExtensionAPI, deps: SettingsCo
 								}
 
 								if (isFeatureSettingId(id) && isFeatureState(newValue)) {
-									settingsList.updateValue(id, newValue);
 									if (id === "editor") {
 										done(undefined);
 										// Changing the editor component while ctx.ui.custom() is active clears the
 										// custom component without resolving it, leaving Pi's input loop stuck.
 										// Close the settings UI first, then apply the editor swap on the next tick.
-										setTimeout(() => {
+										const applyEditorChange = () => {
 											try {
 												applyFeatureChange(id, newValue);
 											} catch (error) {
 												const message = error instanceof Error ? error.message : String(error);
 												ctx.ui.notify(`Could not update Zentui settings: ${message}`, "error");
 											}
-										}, 0);
+										};
+										deps.sessionLifecycle.defer(applyEditorChange);
 										return;
 									}
 
 									applyFeatureChange(id, newValue);
+									settingsList.updateValue(id, newValue);
 									return;
 								}
 
@@ -702,6 +751,15 @@ export function registerZentuiSettingsCommand(pi: ExtensionAPI, deps: SettingsCo
 										settingsList.updateValue(id, newValue);
 										deps.requestRender();
 										ctx.ui.notify(`Context style: ${newValue}`, "info");
+										tui.requestRender();
+										return;
+									}
+
+									if (id === "separator" && isSeparatorStyle(newValue)) {
+										deps.setSeparator(newValue);
+										settingsList.updateValue(id, newValue);
+										deps.requestRender();
+										ctx.ui.notify(`Separator: ${newValue}`, "info");
 										tui.requestRender();
 										return;
 									}
@@ -720,6 +778,17 @@ export function registerZentuiSettingsCommand(pi: ExtensionAPI, deps: SettingsCo
 										settingsList.updateValue(id, newValue);
 										deps.requestRender();
 										ctx.ui.notify(`Path depth: ${newValue}`, "info");
+										tui.requestRender();
+										return;
+									}
+
+									if (id === "branchLength") {
+										const maxLength = parseGitBranchLengthValue(newValue);
+										if (maxLength === undefined) return;
+										deps.setGitBranch({ maxLength });
+										settingsList.updateValue(id, newValue);
+										deps.requestRender();
+										ctx.ui.notify(`Branch length: ${newValue}`, "info");
 										tui.requestRender();
 										return;
 									}
@@ -802,6 +871,8 @@ export function registerZentuiSettingsCommand(pi: ExtensionAPI, deps: SettingsCo
 									tui.requestRender();
 								}
 							} catch (error) {
+								settingsList = makeSettingsList();
+								tui.requestRender();
 								const message = error instanceof Error ? error.message : String(error);
 								ctx.ui.notify(`Could not update Zentui settings: ${message}`, "error");
 							}

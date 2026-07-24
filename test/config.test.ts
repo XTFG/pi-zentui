@@ -1,4 +1,17 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	readlinkSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -6,12 +19,15 @@ import {
 	defaultConfig,
 	mergeConfig,
 	saveColorSourcesPatch,
+	saveContextThresholdsPatch,
 	saveExtensionStatusColorMode,
 	saveExtensionStatusPlacement,
 	saveFixedEditorPatch,
 	saveFooterFormatPatch,
 	saveFooterSegmentsPatch,
+	saveGitBranchPatch,
 	savePathDisplayPatch,
+	saveSeparatorPatch,
 	saveUiFeaturesPatch,
 } from "../extensions/zentui/config";
 import {
@@ -21,6 +37,12 @@ import {
 	renderStyleForSource,
 	renderTerminalStyle,
 } from "../extensions/zentui/style";
+
+function configTempFiles(dir: string, filename = "zentui.json"): string[] {
+	return readdirSync(dir).filter(
+		(name) => name.startsWith(`.${filename}.`) && name.endsWith(".tmp"),
+	);
+}
 
 describe("mergeConfig", () => {
 	it("defaults project refresh polling to 30 seconds and Starship styles", () => {
@@ -33,6 +55,7 @@ describe("mergeConfig", () => {
 		expect(config.colors.gitCommit).toBe("bold green");
 		expect(config.colors.gitMetricsAdded).toBe("bold green");
 		expect(config.colors.gitMetricsDeleted).toBe("bold red");
+		expect(config.colors.sessionName).toBe("bold green");
 		expect(config.colors.contextNormal).toBe("bright-black");
 		expect(config.colors.tokens).toBe("bright-black");
 		expect(config.colors.extensionStatus).toBe("bright-black");
@@ -52,6 +75,7 @@ describe("mergeConfig", () => {
 		});
 		expect(config.footerSegments).toEqual({
 			cwd: true,
+			sessionName: true,
 			gitBranch: true,
 			gitStatus: true,
 			runtime: true,
@@ -142,6 +166,192 @@ describe("mergeConfig", () => {
 		).toBe(30_000);
 	});
 
+	it("defaults separator style to pipe and accepts supported values", () => {
+		expect(mergeConfig({}).separator).toBe("pipe");
+		expect(defaultConfig.separator).toBe("pipe");
+		for (const separator of ["pipe", "dot", "chevron", "none"] as const) {
+			expect(mergeConfig({ separator }).separator).toBe(separator);
+		}
+	});
+
+	it("falls back to pipe for invalid separator styles", () => {
+		for (const separator of ["arrow", "", 123, null, true]) {
+			expect(mergeConfig({ separator }).separator).toBe("pipe");
+		}
+	});
+
+	it("saves separator style without erasing unknown config", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		try {
+			writeFileSync(path, `${JSON.stringify({ unknown: true, contextStyle: "gauge" }, null, 2)}\n`);
+
+			const config = saveSeparatorPatch("chevron", path);
+			const raw = JSON.parse(readFileSync(path, "utf8"));
+
+			expect(config.separator).toBe("chevron");
+			expect(raw).toEqual({
+				unknown: true,
+				contextStyle: "gauge",
+				separator: "chevron",
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses corrupt config without changing its bytes", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		const original = "{ invalid json\n";
+		try {
+			writeFileSync(path, original);
+
+			expect(() => saveSeparatorPatch("dot", path)).toThrow(
+				/Refusing to save Zentui config.*corrupt/,
+			);
+			expect(readFileSync(path, "utf8")).toBe(original);
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("creates missing config atomically and returns the config written to disk", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		try {
+			expect(existsSync(path)).toBe(false);
+			const config = saveFooterFormatPatch("$cwd $fill $context", path);
+			const raw = JSON.parse(readFileSync(path, "utf8"));
+
+			expect(raw).toEqual({ footerFormat: "$cwd $fill $context" });
+			expect(config).toEqual(mergeConfig(raw));
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.runIf(process.platform !== "win32")(
+		"preserves the existing destination mode during atomic replacement",
+		() => {
+			const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+			const path = join(dir, "zentui.json");
+			try {
+				writeFileSync(path, `${JSON.stringify({ separator: "pipe" }, null, 2)}\n`);
+				chmodSync(path, 0o600);
+
+				saveSeparatorPatch("dot", path);
+
+				expect(statSync(path).mode & 0o777).toBe(0o600);
+				expect(JSON.parse(readFileSync(path, "utf8")).separator).toBe("dot");
+				expect(configTempFiles(dir)).toEqual([]);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("updates a symlink target atomically without replacing the symlink", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const targetDir = join(dir, "target");
+		const targetPath = join(targetDir, "actual.json");
+		const linkPath = join(dir, "zentui.json");
+		try {
+			mkdirSync(targetDir);
+			writeFileSync(targetPath, `${JSON.stringify({ unknown: true }, null, 2)}\n`);
+			chmodSync(targetPath, 0o600);
+			symlinkSync(targetPath, linkPath);
+			const originalLink = readlinkSync(linkPath);
+
+			const config = saveSeparatorPatch("chevron", linkPath);
+			const raw = JSON.parse(readFileSync(targetPath, "utf8"));
+
+			expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
+			expect(readlinkSync(linkPath)).toBe(originalLink);
+			expect(raw).toEqual({ unknown: true, separator: "chevron" });
+			expect(config).toEqual(mergeConfig(raw));
+			if (process.platform !== "win32") {
+				expect(statSync(targetPath).mode & 0o777).toBe(0o600);
+			}
+			expect(configTempFiles(targetDir, "actual.json")).toEqual([]);
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a dangling symlink without changing it", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const targetDir = join(dir, "target");
+		const missingTarget = join(targetDir, "missing.json");
+		const linkPath = join(dir, "zentui.json");
+		try {
+			mkdirSync(targetDir);
+			symlinkSync(missingTarget, linkPath);
+			const originalLink = readlinkSync(linkPath);
+
+			expect(() => saveSeparatorPatch("dot", linkPath)).toThrow(/Refusing to save Zentui config/);
+			expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
+			expect(readlinkSync(linkPath)).toBe(originalLink);
+			expect(existsSync(missingTarget)).toBe(false);
+			expect(configTempFiles(targetDir, "missing.json")).toEqual([]);
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves scalar and nested unknown keys through the shared mutation path", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		try {
+			writeFileSync(
+				path,
+				`${JSON.stringify(
+					{
+						futureScalar: "keep",
+						pathDisplay: { mode: "basename", depth: 2, futureNested: { keep: true } },
+					},
+					null,
+					2,
+				)}\n`,
+			);
+
+			saveSeparatorPatch("dot", path);
+			const config = savePathDisplayPatch({ mode: "full" }, path);
+			const raw = JSON.parse(readFileSync(path, "utf8"));
+
+			expect(raw.futureScalar).toBe("keep");
+			expect(raw.separator).toBe("dot");
+			expect(raw.pathDisplay).toEqual({
+				mode: "full",
+				depth: 2,
+				futureNested: { keep: true },
+			});
+			expect(config).toEqual(mergeConfig(raw));
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the destination and removes the temp file when serialization fails", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		const original = `${JSON.stringify({ unknown: true }, null, 2)}\n`;
+		try {
+			writeFileSync(path, original);
+
+			expect(() => saveContextThresholdsPatch({ warning: 1n as never }, path)).toThrow();
+			expect(readFileSync(path, "utf8")).toBe(original);
+			expect(configTempFiles(dir)).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("defaults context style/thresholds and accepts valid overrides", () => {
 		expect(mergeConfig({}).contextStyle).toBe("text");
 		expect(mergeConfig({}).contextThresholds).toEqual({ warning: 70, error: 90 });
@@ -217,6 +427,47 @@ describe("mergeConfig", () => {
 
 			const depthConfig = savePathDisplayPatch({ depth: 1 }, path);
 			expect(depthConfig.pathDisplay).toEqual({ mode: "full", depth: 1 });
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("defaults git branch length to full and accepts positive integer values", () => {
+		expect(mergeConfig({}).gitBranch).toEqual({ maxLength: "full" });
+		expect(defaultConfig.gitBranch).toEqual({ maxLength: "full" });
+		for (const maxLength of [1, 10, 17, 20, 30, 40, 50, 10_000]) {
+			expect(mergeConfig({ gitBranch: { maxLength } }).gitBranch).toEqual({ maxLength });
+		}
+		expect(mergeConfig({ gitBranch: { maxLength: "full" } }).gitBranch).toEqual({
+			maxLength: "full",
+		});
+	});
+
+	it("falls back to full for invalid git branch lengths", () => {
+		for (const maxLength of [0, -1, 1.5, "10", "short", null, true]) {
+			expect(mergeConfig({ gitBranch: { maxLength } }).gitBranch).toEqual({
+				maxLength: "full",
+			});
+		}
+		expect(mergeConfig({ gitBranch: 20 }).gitBranch).toEqual({ maxLength: "full" });
+	});
+
+	it("saves git branch length without erasing unknown config", () => {
+		const dir = mkdtempSync(join(tmpdir(), "zentui-config-"));
+		const path = join(dir, "zentui.json");
+		try {
+			writeFileSync(
+				path,
+				`${JSON.stringify({ unknown: true, gitBranch: { maxLength: 17, future: true } }, null, 2)}\n`,
+			);
+
+			const config = saveGitBranchPatch({ maxLength: 30 }, path);
+			const raw = JSON.parse(readFileSync(path, "utf8"));
+			expect(config.gitBranch).toEqual({ maxLength: 30 });
+			expect(raw).toEqual({
+				unknown: true,
+				gitBranch: { maxLength: 30, future: true },
+			});
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -422,6 +673,7 @@ describe("mergeConfig", () => {
 	it("accepts valid footer segment preferences and ignores invalid values", () => {
 		expect(mergeConfig({ footerSegments: { cwd: false, tokens: false } }).footerSegments).toEqual({
 			cwd: false,
+			sessionName: true,
 			gitBranch: true,
 			gitStatus: true,
 			runtime: true,
@@ -442,6 +694,7 @@ describe("mergeConfig", () => {
 				.footerSegments,
 		).toEqual({
 			cwd: true,
+			sessionName: true,
 			gitBranch: false,
 			gitStatus: false,
 			runtime: true,
@@ -457,6 +710,19 @@ describe("mergeConfig", () => {
 			tokens: true,
 			cost: true,
 		});
+	});
+
+	it("normalizes session-name preferences", () => {
+		expect(mergeConfig({ colors: { sessionName: "success" } }).colors.sessionName).toBe("success");
+		expect(mergeConfig({ footerSegments: { sessionName: false } }).footerSegments.sessionName).toBe(
+			false,
+		);
+		expect(mergeConfig({ colors: { sessionName: "not-a-color" } }).colors.sessionName).toBe(
+			"bold green",
+		);
+		expect(mergeConfig({ footerSegments: { sessionName: "on" } }).footerSegments.sessionName).toBe(
+			true,
+		);
 	});
 
 	it("saves color source patches without erasing unknown user config", () => {
@@ -644,6 +910,7 @@ describe("mergeConfig", () => {
 
 			expect(config.footerSegments).toEqual({
 				cwd: true,
+				sessionName: true,
 				gitBranch: true,
 				gitStatus: true,
 				runtime: true,
@@ -680,6 +947,7 @@ describe("mergeConfig", () => {
 
 			expect(config.footerSegments).toEqual({
 				cwd: true,
+				sessionName: true,
 				gitBranch: true,
 				gitStatus: true,
 				runtime: false,
